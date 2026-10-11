@@ -5768,6 +5768,30 @@ fn build_official_upstream_request(
         Some(base_url) => base_url,
         None => default_official_base_url(platform)?,
     };
+    // Official Codex credentials speak Responses too. Other clients may send
+    // Chat Completions or Anthropic Messages, so use the same bidirectional bridge
+    // as API credentials instead of forwarding an unsupported backend path.
+    // Convert before backend normalization: the bridge introduces fields such as
+    // max_output_tokens and would otherwise discard the required store=false.
+    let mut upstream_path = path.to_string();
+    let mut bridge_kind = None;
+    let normalized_path = normalize_api_upstream_path("openai-responses", path);
+    if platform == PlatformId::Codex
+        && matches!(
+            normalized_path.trim_end_matches('/'),
+            "/chat/completions" | "/messages"
+        )
+    {
+        let bridge = prepare_protocol_bridge_request(
+            platform,
+            ApiDialect::OpenAiResponses,
+            &normalized_path,
+            &rewritten_body,
+        )?;
+        upstream_path = bridge.upstream_path;
+        rewritten_body = bridge.body;
+        bridge_kind = bridge.kind;
+    }
     // ChatGPT's backend needs to know which account of the token's owner to bill,
     // the way the agent-identity branch above already tells it. The Codex CLI sends
     // this on every request; only accounts with several workspaces notice its
@@ -5826,7 +5850,7 @@ fn build_official_upstream_request(
             }
         }
     } else {
-        (path.to_string(), rewritten_body, None)
+        (upstream_path, rewritten_body, bridge_kind)
     };
     let target_url = build_target_url(base_url, &upstream_path, query);
     let streaming_request = request_body_requests_stream(&rewritten_body);
@@ -8152,6 +8176,10 @@ mod tests {
 
     mod quota_errors {
         include!("route_proxy_service/quota_error_tests.rs");
+    }
+
+    mod official_codex_bridge {
+        include!("route_proxy_service/official_codex_bridge_tests.rs");
     }
 
     // The pre-mode signatures: these assertions are about the aggregated list.
