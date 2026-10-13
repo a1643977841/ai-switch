@@ -2200,7 +2200,10 @@ command = "npx"
                 .collect::<Vec<_>>(),
             vec!["zcode_codex"]
         );
-        assert!(fixture.home.join(".zcode/v2/config.json").exists());
+        assert!(fixture
+            .home
+            .join(".zcode/v2/provider_config.json")
+            .exists());
         // Neither the CLI config nor the catalog it references belongs to this write.
         assert!(!fixture.home.join(".codex/config.toml").exists());
         assert!(!fixture
@@ -2241,22 +2244,32 @@ command = "npx"
         .await
         .expect("write");
 
-        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/config.json"))
+        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
             .await
             .expect("read zcode config");
         let json: Value = serde_json::from_slice(&raw).expect("json");
-        let models = &json["provider"]["ai-switch-codex"]["models"];
+        let rules = json["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .expect("provider model rules");
+        let rule_for = |model_id: &str| {
+            rules
+                .iter()
+                .find(|rule| rule["modelId"] == model_id)
+                .unwrap_or_else(|| panic!("no rule for {model_id}: {json}"))
+        };
 
         // Declared efforts survive exactly, in order, with no profile padding.
         assert_eq!(
-            models["gpt-5.6-sol"]["reasoning"]["variants"],
-            serde_json::json!(["medium", "max"])
+            rule_for("gpt-5.6-sol")["config"]["optionSpecs"]["reasoningLevel"],
+            serde_json::json!({ "values": ["medium", "max"] })
         );
         // No declaration → no reasoning block, so ZCode renders no control.
         assert!(
-            models["some-audio-model"].get("reasoning").is_none(),
+            rule_for("some-audio-model")["config"]["optionSpecs"]
+                .get("reasoningLevel")
+                .is_none(),
             "a model with no declared efforts must not get a reasoning block: {}",
-            models["some-audio-model"]
+            rule_for("some-audio-model")
         );
     }
 
@@ -2264,7 +2277,7 @@ command = "npx"
     async fn a_corrupt_zcode_config_does_not_block_the_codex_cli_write() {
         let fixture = ServiceFixture::new().await;
         seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
-        let zcode_path = fixture.home.join(".zcode/v2/config.json");
+        let zcode_path = fixture.home.join(".zcode/v2/provider_config.json");
         tokio::fs::create_dir_all(zcode_path.parent().unwrap())
             .await
             .expect("dir");
@@ -2316,7 +2329,7 @@ command = "npx"
     async fn a_new_key_is_removed_only_when_every_client_fails() {
         let fixture = ServiceFixture::new().await;
         seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
-        let zcode_path = fixture.home.join(".zcode/v2/config.json");
+        let zcode_path = fixture.home.join(".zcode/v2/provider_config.json");
         tokio::fs::create_dir_all(zcode_path.parent().unwrap())
             .await
             .expect("dir");
@@ -2375,7 +2388,10 @@ command = "npx"
                 ..
             }
         ));
-        assert!(!fixture.home.join(".zcode/v2/config.json").exists());
+        assert!(!fixture
+            .home
+            .join(".zcode/v2/provider_config.json")
+            .exists());
     }
 
     #[tokio::test]
@@ -2395,15 +2411,36 @@ command = "npx"
         .await
         .expect("write");
 
-        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/config.json"))
+        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
             .await
             .expect("read");
         let json: Value = serde_json::from_slice(&raw).expect("json");
-        let entry = &json["provider"]["ai-switch-codex"];
-        assert_eq!(entry["models"]["gpt-5.6-sol"]["limit"]["output"], 128000);
+        let rule = json["config"]["providerConfigRules"]["providerRules"]
+            .as_array()
+            .expect("provider rules")
+            .iter()
+            .find(|rule| rule["providerId"] == "ai-switch-codex")
+            .expect("ai-switch-codex rule");
+        assert_eq!(
+            rule["config"]["api"]["headers"]["ai-switch-managed"],
+            "codex"
+        );
+        assert_eq!(rule["config"]["personalModelIds"], serde_json::json!(["gpt-5.6-sol"]));
+        let model_rule = json["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .expect("provider model rules")
+            .iter()
+            .find(|entry| entry["modelId"] == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol rule");
+        assert_eq!(
+            model_rule["config"]["optionSpecs"]["maxOutputTokens"]["max"],
+            128000
+        );
         // Same Codex default the CLI catalog writes for a passthrough gpt id.
-        assert_eq!(entry["models"]["gpt-5.6-sol"]["limit"]["context"], 272000);
-        assert_eq!(entry["aiSwitch"]["platform"], "codex");
+        assert_eq!(
+            model_rule["config"]["properties"]["contextWindow"],
+            272000
+        );
     }
 
     #[tokio::test]
@@ -2584,21 +2621,26 @@ model_provider = "ai-switch"
         .await
         .expect("write");
 
-        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/config.json"))
+        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
             .await
             .expect("read");
         let json: Value = serde_json::from_slice(&raw).expect("json");
-        let models = json["provider"]["ai-switch-codex"]["models"]
-            .as_object()
-            .expect("models");
+        let models = json["config"]["providerConfigRules"]["providerRules"]
+            .as_array()
+            .expect("provider rules")
+            .iter()
+            .find(|rule| rule["providerId"] == "ai-switch-codex")
+            .expect("ai-switch-codex rule")["config"]["personalModelIds"]
+            .as_array()
+            .expect("model ids");
         // One entry per account, so a request names the account it wants. The
         // aggregated id is gone: keeping it would leave a rotating door open.
-        assert!(models.contains_key("Grox/gpt-5.6-sol"), "models={models:?}");
+        assert!(models.contains(&serde_json::json!("Grox/gpt-5.6-sol")), "models={models:?}");
         assert!(
-            models.contains_key("247-Kan/gpt-5.6-sol"),
+            models.contains(&serde_json::json!("247-Kan/gpt-5.6-sol")),
             "models={models:?}"
         );
-        assert!(!models.contains_key("gpt-5.6-sol"), "models={models:?}");
+        assert!(!models.contains(&serde_json::json!("gpt-5.6-sol")), "models={models:?}");
 
         // The Codex CLI reads its own catalog file, which has to agree — a bare
         // `--model` would otherwise not be in the list the CLI offers.
@@ -2649,13 +2691,18 @@ model_provider = "ai-switch"
         .await
         .expect("write");
 
-        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/config.json"))
+        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
             .await
             .expect("read");
         let json: Value = serde_json::from_slice(&raw).expect("json");
-        let entry = &json["provider"]["ai-switch-codex"];
+        let model_rule = json["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .expect("provider model rules")
+            .iter()
+            .find(|entry| entry["modelId"] == "glm-5.3")
+            .expect("glm-5.3 rule");
 
-        assert_eq!(entry["models"]["glm-5.3"]["limit"]["context"], 1000000);
+        assert_eq!(model_rule["config"]["properties"]["contextWindow"], 1000000);
     }
 
     #[tokio::test]
@@ -2813,15 +2860,18 @@ model_provider = "ai-switch"
         assert_eq!(catalog["models"][0]["context_window"], 1_000_000);
 
         let zcode: Value = serde_json::from_slice(
-            &tokio::fs::read(fixture.home.join(".zcode/v2/config.json"))
+            &tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
                 .await
                 .expect("read zcode"),
         )
         .expect("zcode json");
-        assert_eq!(
-            zcode["provider"]["ai-switch-codex"]["models"]["gpt-5.5"]["limit"]["context"],
-            1_000_000
-        );
+        let zcode_rule = zcode["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .expect("provider model rules")
+            .iter()
+            .find(|entry| entry["modelId"] == "gpt-5.5")
+            .expect("gpt-5.5 rule");
+        assert_eq!(zcode_rule["config"]["properties"]["contextWindow"], 1_000_000);
 
         let harness: serde_yaml::Value = serde_yaml::from_slice(
             &tokio::fs::read(fixture.home.join(".dsh/settings.yaml"))
@@ -2917,7 +2967,7 @@ model_provider = "ai-switch"
         );
 
         // A ZCode-only drift still has to surface on the shared nudge.
-        tokio::fs::remove_file(fixture.home.join(".zcode/v2/config.json"))
+        tokio::fs::remove_file(fixture.home.join(".zcode/v2/provider_config.json"))
             .await
             .expect("remove");
         assert!(

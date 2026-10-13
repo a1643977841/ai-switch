@@ -352,13 +352,13 @@ experimental_bearer_token = "sentinel"
     #[tokio::test]
     async fn config_write_clients_report_per_client_file_status() {
         let fixture = TargetFixture::new().await;
-        let zcode_path = fixture.home.join(".zcode/v2/config.json");
+        let zcode_path = fixture.home.join(".zcode/v2/provider_config.json");
         tokio::fs::create_dir_all(zcode_path.parent().unwrap())
             .await
             .expect("dir");
         tokio::fs::write(
             &zcode_path,
-            br#"{"provider":{"builtin:bigmodel":{"kind":"anthropic"}}}"#,
+            br#"{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[{"providerId":"builtin:bigmodel","config":{"api":{"type":"anthropic-messages"}}}]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[]}}}"#,
         )
         .await
         .expect("write");
@@ -410,7 +410,7 @@ experimental_bearer_token = "sentinel"
     #[tokio::test]
     async fn config_write_clients_surface_a_corrupt_file_without_erroring() {
         let fixture = TargetFixture::new().await;
-        let zcode_path = fixture.home.join(".zcode/v2/config.json");
+        let zcode_path = fixture.home.join(".zcode/v2/provider_config.json");
         tokio::fs::create_dir_all(zcode_path.parent().unwrap())
             .await
             .expect("dir");

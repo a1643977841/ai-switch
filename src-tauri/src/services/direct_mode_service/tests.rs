@@ -494,7 +494,7 @@ async fn unchecked_native_client_is_untouched_when_writing_another_codex_client(
         .path()
         .join(".codex/ai-switch-model-catalog.json")
         .exists());
-    assert!(root.path().join(".zcode/v2/config.json").exists());
+    assert!(root.path().join(".zcode/v2/provider_config.json").exists());
 }
 
 #[tokio::test]

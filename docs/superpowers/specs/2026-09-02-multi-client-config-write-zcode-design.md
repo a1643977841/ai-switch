@@ -256,3 +256,15 @@ settings 新增 `config_write_clients_json`，形如 `{"codex":["codex","zcode"]
 
 `pnpm typecheck`、`pnpm test:run`、`CARGO_TARGET_DIR=target-codex cargo test`、`cargo fmt --check`。按 AGENTS.md，AI 验证只使用 `src-tauri/target-codex/`。
 
+
+## 2026-10-13 更新：ZCode 3.14 换了配置文件
+
+本机 ZCode 升级到 3.14.5 后，provider 清单不再放在 `.zcode/v2/config.json`，而放在 `.zcode/v2/provider_config.json`（`schemaVersion: 1`，`config.providerConfigRules.providerRules` + `config.modelConfigRules.providerModelRules`）。旧文件只在目标文件不存在时被一次性导入，之后再写它不会有任何效果 —— 这就是写入的模型不生效的原因。适配器已改为写新文件，旧文件不再维护。
+
+新 schema 的几条硬约束（都来自 3.14.5 的 `out/host/index.js`）：
+
+- 每一层都是 zod `strict()`：多一个未知键，整个文件解析失败，ZCode 降级为空 provider 列表。托管标记不能写成自由键，只能落在客户端自己的字段里 —— 现在放在 `config.api.headers[ai-switch-managed] = <platform>`（只发给我们自己的代理）。
+- `config.api.type` 只有 `anthropic-messages` / `openai-chat-completions` / `openai-responses`；路径由 ZCode 自己补（`/v1/messages`、`/chat/completions`、`/responses`），所以 codex 仍写 `{base}/v1`、claude 仍写 `{base}`。
+- `config.group` 自定义 provider 只能是 `standard-personal`；`builtinModelIds` 在个人规则里是禁止键。
+- 模型清单拆成两处：`config.personalModelIds` / `config.modelOrder`（provider 上）加 `modelConfigRules.providerModelRules` 里每个模型的 `properties.contextWindow`、`properties.inputFormat.supportsImage`、`optionSpecs.maxOutputTokens.max`、`optionSpecs.reasoningLevel.values`（都可选，但 `contextWindow` 与 `max` 必须是正整数，所以未声明时整块省略）。
+- 同一 `(providerId, modelId)` 不能同时出现在 `providerModelRules` 和 `manualProviderModelRules`，否则整份文件校验失败：重写时会摘掉我们自己 provider 的 manual 规则。
