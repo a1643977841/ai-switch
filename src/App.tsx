@@ -23,6 +23,7 @@ import { I18nProvider } from "./lib/i18n";
 import { createQueryClient } from "./lib/query/queryClient";
 import { isDesktop, isLocalWebDevRuntime } from "./lib/transport";
 import { AccountsScreen } from "./screens/AccountsScreen";
+import { UsageOverviewPanel } from "./components/accounts/UsageOverviewPanel";
 import { AboutScreen } from "./screens/AboutScreen";
 import { BatchesScreen } from "./screens/BatchesScreen";
 import { DashboardScreen } from "./screens/DashboardScreen";
@@ -73,6 +74,7 @@ const implementedScreens = new Set([
   "Log",
   "MCP",
   "Skills",
+  "Stats",
   "About",
   "Vibe",
 ]);
@@ -273,6 +275,11 @@ export function App() {
                 {screen === "ImageGen" && <ImageGenerationScreen />}
                 {screen === "MCP" && <McpScreen />}
                 {screen === "Skills" && <SkillsScreen />}
+                {screen === "Stats" && (
+                  <section className="overflow-hidden rounded-xl border border-stone-200 bg-white shadow-sm">
+                    <UsageOverviewPanel standalone />
+                  </section>
+                )}
                 {screen === "About" && <AboutScreen />}
                 {screen === "Log" && <OperationLogScreen />}
                   {!implementedScreens.has(screen) && (

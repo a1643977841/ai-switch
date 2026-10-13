@@ -427,7 +427,11 @@ function RequestRow({
   );
 }
 
-export function UsageOverviewPanel() {
+/**
+ * `standalone` renders the panel as a top-level page instead of a section
+ * hanging under the account workspace's filter bar.
+ */
+export function UsageOverviewPanel({ standalone = false }: { standalone?: boolean } = {}) {
   const [period, setPeriod] = useState<Period>("today");
   const [page, setPage] = useState(1);
   const [dimension, setDimension] = useState<GroupDimension | null>(null);
@@ -501,7 +505,9 @@ export function UsageOverviewPanel() {
   })();
 
   return (
-    <div className="space-y-3 border-t border-stone-200/80 px-3 py-3">
+    <div
+      className={`space-y-3 px-3 py-3 ${standalone ? "" : "border-t border-stone-200/80"}`}
+    >
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <p className="text-[13px] font-semibold text-stone-950">用量总览</p>

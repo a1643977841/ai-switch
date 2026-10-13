@@ -402,7 +402,7 @@ function renderScreen(
   return result;
 }
 
-async function selectAccountView(name: "默认组" | "未入池" | "已归档" | "统计") {
+async function selectAccountView(name: "默认组" | "未入池" | "已归档") {
   const button = screen.getByTitle(new RegExp(`^${name}`));
   if (button.getAttribute("aria-pressed") !== "true") {
     await userEvent.click(button);
@@ -2605,7 +2605,7 @@ describe("AccountsScreen", () => {
     });
   });
 
-  it("switches between dynamic groups and statistics with scoped actions", async () => {
+  it("switches between dynamic groups with scoped actions", async () => {
     renderScreen("codex", "in_pool");
 
     await waitFor(() =>
@@ -2634,10 +2634,9 @@ describe("AccountsScreen", () => {
       ),
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "统计" }));
-    expect(await screen.findByText("用量总览")).toBeInTheDocument();
-    expect(screen.queryByText("筛选：")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("移动到分组")).not.toBeInTheDocument();
+    // 统计不再挂在算力池底栏：它是左侧导航里的独立页面。
+    expect(screen.queryByRole("button", { name: "统计" })).not.toBeInTheDocument();
+    expect(screen.queryByText("用量总览")).not.toBeInTheDocument();
   });
 
   it("shows Hermes as partial while letting it write its own config", async () => {

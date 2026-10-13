@@ -101,13 +101,35 @@ describe("AppLayout", () => {
       </I18nProvider>,
     );
 
+    await userEvent.click(screen.getByRole("button", { name: "统计" }));
     await userEvent.click(screen.getByRole("button", { name: /MCP/ }));
     await userEvent.click(screen.getByRole("button", { name: /技能/ }));
     await userEvent.click(screen.getByRole("button", { name: /关于/ }));
 
+    expect(onNavigate).toHaveBeenCalledWith("Stats");
     expect(onNavigate).toHaveBeenCalledWith("MCP");
     expect(onNavigate).toHaveBeenCalledWith("Skills");
     expect(onNavigate).toHaveBeenCalledWith("About");
+  });
+
+  it("lists usage first in the system group and highlights it on its own", () => {
+    const onNavigate = vi.fn();
+
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout activeScreen="Stats" onNavigate={onNavigate}
+          onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    const stats = screen.getByRole("button", { name: "统计" });
+    const mcp = screen.getByRole("button", { name: /MCP/ });
+    // 统计 moved out of the pool status bar, so it leads the system group.
+    expect(stats.compareDocumentPosition(mcp) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(stats).toHaveAttribute("aria-current", "page");
+    expect(mcp).not.toHaveAttribute("aria-current");
   });
 
   it("hides disabled agents from the sidebar", () => {

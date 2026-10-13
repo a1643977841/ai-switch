@@ -66,7 +66,6 @@ import { RequestCompressionOption } from "../components/accounts/RequestCompress
 import { requestCompressionModeFromConfig, writeRequestCompressionMode, type RequestCompressionMode } from "../lib/requestCompression";
 import { ResponsesPlaintextReasoningOption } from "../components/accounts/ResponsesPlaintextReasoningOption";
 import { plaintextReasoningModeFromConfig, writePlaintextReasoningMode, type ResponsesPlaintextReasoningMode } from "../lib/responsesPlaintextReasoning";
-import { UsageOverviewPanel } from "../components/accounts/UsageOverviewPanel";
 import { QuickEditDialog } from "../components/accounts/QuickEditDialog";
 import { neighborsForDrop } from "../lib/accountReorder";
 import {
@@ -240,7 +239,7 @@ const DEFAULT_MAX_CONCURRENCY = 5;
 
 type PlatformKey = PlatformId;
 type CreateMode = "api" | "official" | "external";
-type AccountView = "in_pool" | "out_of_pool" | "archived" | "stats";
+type AccountView = "in_pool" | "out_of_pool" | "archived";
 type CreateTab = "basic" | "advanced";
 type EditTab = "basic" | "advanced" | "failure" | "other";
 type RowAction = {
@@ -3376,10 +3375,9 @@ export function AccountsScreen({
   const [cooldownEditError, setCooldownEditError] = useState<string | null>(null);
   const modelTestStorageKey = modelTestAccount?.id ?? poolModelTestKey(activePlatform);
   const routeTestModel = modelTestModels[modelTestStorageKey]?.model ?? "";
-  const statsOpen = accountView === "stats";
-  const accountGroupId = statsOpen ? null : selectedGroupId;
+  const accountGroupId = selectedGroupId;
   const accountScope: RouteCredentialPoolScope =
-    statsOpen || accountGroupId == null
+    accountGroupId == null
       ? "in_pool"
       : accountGroupId.endsWith("-out")
         ? "out_of_pool"
@@ -3665,7 +3663,6 @@ export function AccountsScreen({
     },
     placeholderData: keepPreviousData,
     staleTime: 0,
-    enabled: !statsOpen,
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
   });
@@ -4258,7 +4255,7 @@ export function AccountsScreen({
   };
 
   const openExport = () => {
-    if (accountView === "stats" || selectedAccountIds.size === 0) {
+    if (selectedAccountIds.size === 0) {
       return;
     }
     setExportRequest({
@@ -5606,12 +5603,7 @@ export function AccountsScreen({
   };
 
   const setSelectedAccountsStatus = () => {
-    if (
-      selectedAccountIds.size === 0 ||
-      !batchStatus ||
-      batchStatusMutation.isPending ||
-      accountView === "stats"
-    ) {
+    if (selectedAccountIds.size === 0 || !batchStatus || batchStatusMutation.isPending) {
       return;
     }
     batchStatusMutation.mutate({
@@ -5983,13 +5975,6 @@ export function AccountsScreen({
         {modelTestAutoCloseIn} 秒后自动关闭
       </span>
     ) : null;
-
-  const selectAccountView = (view: AccountView) => {
-    if (view === accountView) {
-      return;
-    }
-    setAccountView(view);
-  };
 
   const selectRouteGroup = (groupId: string) => {
     if (groupId === selectedGroupId && accountView === "in_pool") {
@@ -6749,18 +6734,6 @@ export function AccountsScreen({
           </div>
         ) : null}
       <>
-        {statsOpen ? (
-          <motion.div
-            key="account-stats"
-            className="account-view-motion min-h-full"
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            transition={{ duration: 0.26, ease: [0.22, 1, 0.36, 1] }}
-          >
-            <UsageOverviewPanel />
-          </motion.div>
-        ) : (
           <motion.div
             key={accountView}
             className="account-view-motion min-h-full"
@@ -8020,7 +7993,6 @@ export function AccountsScreen({
         </div>
       </section>
           </motion.div>
-        )}
       </>
 
         </div>
@@ -8030,7 +8002,7 @@ export function AccountsScreen({
         >
           <div aria-label="账号分组" className="flex h-7 max-w-[65%] shrink-0 items-center gap-0.5 overflow-x-auto rounded-lg border border-stone-200 bg-white p-0.5 shadow-sm" role="group">
             {routePoolGroups.map((group) => {
-              const selected = accountView !== "stats" && group.id === selectedGroupId;
+              const selected = group.id === selectedGroupId;
               return (
                 <button
                   aria-label={`${group.name}${group.is_active ? "，当前激活" : ""}`}
@@ -8066,16 +8038,6 @@ export function AccountsScreen({
                 </button>
               );
             })}
-            <button
-              aria-label="统计"
-              aria-pressed={accountView === "stats"}
-              className="grid h-6 shrink-0 place-items-center rounded-md px-1.5 text-[11px] font-semibold text-stone-600 motion-control hover:bg-stone-100"
-              onClick={() => selectAccountView("stats")}
-              title="统计"
-              type="button"
-            >
-              统计
-            </button>
             <button
               aria-label="新建分组"
               className="grid h-6 w-6 shrink-0 place-items-center rounded-md border border-stone-200 text-stone-700 motion-control hover:bg-stone-100"

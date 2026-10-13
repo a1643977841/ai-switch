@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { motion } from "motion/react";
 import {
+  BarChart3,
   ChevronDown,
   Info,
   Images,
@@ -479,6 +480,13 @@ export function AppLayout({
                 >
                   {t("layout.system")}
                 </p>
+                <NavButton
+                  active={activeScreen === "Stats"}
+                  collapsed={sidebarContentCollapsed}
+                  icon={BarChart3}
+                  label={t("nav.stats")}
+                  onClick={() => handleNavigate("Stats")}
+                />
                 {saasEnabled && (
                   <NavButton
                     active={activeScreen === "SaaS"}
