@@ -660,32 +660,9 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
           <div className="overflow-hidden rounded-xl border border-stone-200 bg-white">
             <div className="flex items-center justify-between gap-2 border-b border-stone-100 bg-stone-50 px-3 py-2">
               <p className="text-[12px] font-semibold text-stone-700">请求列表</p>
-              <div className="flex items-center gap-1.5">
-                <p className="text-[11px] font-medium text-stone-500">
-                  {formatExactCount(rowCount)} 条
-                </p>
-                <button
-                  aria-label="上一页"
-                  className="grid h-6 w-6 place-items-center rounded-md border border-stone-300 bg-white text-stone-700 motion-control hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
-                  disabled={page <= 1}
-                  onClick={() => setPage((current) => Math.max(1, current - 1))}
-                  type="button"
-                >
-                  <ChevronLeft aria-hidden="true" className="h-3.5 w-3.5" />
-                </button>
-                <span className="whitespace-nowrap font-mono text-[11px] text-stone-600">
-                  {page}/{pageCount}
-                </span>
-                <button
-                  aria-label="下一页"
-                  className="grid h-6 w-6 place-items-center rounded-md border border-stone-300 bg-white text-stone-700 motion-control hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
-                  disabled={page >= pageCount}
-                  onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
-                  type="button"
-                >
-                  <ChevronRight aria-hidden="true" className="h-3.5 w-3.5" />
-                </button>
-              </div>
+              <p className="text-[11px] font-medium text-stone-500">
+                {formatExactCount(rowCount)} 条
+              </p>
             </div>
             {overview.rows.length === 0 ? (
               <p className="px-3 py-4 text-[12px] text-stone-500">当前筛选范围内暂无请求。</p>
@@ -703,6 +680,36 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
                 ))}
               </div>
             )}
+            {overview.rows.length > 0 ? (
+              <div className="flex items-center justify-between gap-2 border-t border-stone-100 bg-stone-50 px-3 py-2">
+                <p className="text-[11px] font-medium text-stone-500">
+                  第 {page} / {pageCount} 页
+                </p>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    aria-label="上一页"
+                    className="grid h-6 w-6 place-items-center rounded-md border border-stone-300 bg-white text-stone-700 motion-control hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+                    disabled={page <= 1}
+                    onClick={() => setPage((current) => Math.max(1, current - 1))}
+                    type="button"
+                  >
+                    <ChevronLeft aria-hidden="true" className="h-3.5 w-3.5" />
+                  </button>
+                  <span className="whitespace-nowrap font-mono text-[11px] text-stone-600">
+                    {page}/{pageCount}
+                  </span>
+                  <button
+                    aria-label="下一页"
+                    className="grid h-6 w-6 place-items-center rounded-md border border-stone-300 bg-white text-stone-700 motion-control hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+                    disabled={page >= pageCount}
+                    onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
+                    type="button"
+                  >
+                    <ChevronRight aria-hidden="true" className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
         </>
       )}
