@@ -327,7 +327,7 @@ const defaultRouteCredentialFailurePolicy: RouteCredentialFailurePolicy = {
   cooldown_enabled: false,
   cooldown_seconds: DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_SECONDS,
   error_status_enabled: true,
-  stream_continue_enabled: true,
+  stream_continue_enabled: false,
   stream_continue_max: DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX,
   failover_enabled: true,
 };
@@ -3292,7 +3292,7 @@ export function AccountsScreen({
     String(DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_SECONDS),
   );
   const [editErrorStatusEnabled, setEditErrorStatusEnabled] = useState(true);
-  const [editStreamContinueEnabled, setEditStreamContinueEnabled] = useState(true);
+  const [editStreamContinueEnabled, setEditStreamContinueEnabled] = useState(false);
   const [editStreamContinueMax, setEditStreamContinueMax] = useState(
     String(DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX),
   );
@@ -9762,7 +9762,7 @@ export function AccountsScreen({
                             <span className="font-semibold">断流后自动续写</span>
                             <span className="block text-[11px] text-stone-600">
                               字节已经发给客户端、无法回滚重试，所以由网关拿着「原会话 + 半截回答 +
-                              继续指令」再问一次，把结果接回同一条响应，客户端只看到一轮正常完成的回答。默认开启。
+                              继续指令」再问一次，把结果接回同一条响应，客户端只看到一轮正常完成的回答。默认关闭：续写是一次完整的计费请求，且交给客户端的是模型并非一次写成的答案，是否值得按渠道自己定。
                             </span>
                           </span>
                         </label>

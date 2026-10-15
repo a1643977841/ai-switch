@@ -29,9 +29,15 @@ pub const MAX_ROUTE_CREDENTIAL_RETRY_INTERVAL_MS: u32 = 60_000;
 pub const MAX_ROUTE_CREDENTIAL_SEMANTIC_ERROR_THRESHOLD: u32 = 1_000;
 pub const MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS: u32 = 86_400;
 /// Whether the gateway re-asks the upstream after a stream that delivered data
-/// but never terminated. On by default: the alternative is handing the client a
-/// half-written answer.
-pub const DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_ENABLED: bool = true;
+/// but never terminated.
+///
+/// Off by default. Continuing costs a second, fully billed upstream call and
+/// hands the client an answer the model never wrote in one piece; the alternative
+/// is a visible truncation the user can react to. Making it opt-in keeps that
+/// spend and that seam a decision the account owner makes per channel, which is
+/// where the difference actually lives — relays disconnect often, first-party
+/// endpoints almost never.
+pub const DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_ENABLED: bool = false;
 /// How many continuation rounds one account may spend on a single client
 /// request. Every round is a real, billed upstream call, so the ceiling is kept
 /// in the same 0–10 band as `retry_count`.
@@ -54,6 +60,8 @@ pub struct RouteCredentialFailurePolicy {
     pub cooldown_seconds: u32,
     pub error_status_enabled: bool,
     /// 流式上游中途断掉时，是否由网关自动续写（把结果接回同一条 response）。
+    /// 默认关闭：续写是一次完整的计费请求，且交给客户端的是模型并非一次写成的
+    /// 答案，是否值得由每个账号自己定。
     pub stream_continue_enabled: bool,
     /// 该账号允许的最大续写轮次；0 等同于关闭。
     pub stream_continue_max: u32,
@@ -609,13 +617,13 @@ mod tests {
         assert!(error.contains("semantic_error_threshold"));
     }
 
-    /// 老账号的 config_json 里没有这三个字段，必须落到默认值：续写照旧开着、
-    /// 预算照旧 10 轮、失败照旧允许切号——否则这次改动会静默改掉线上行为。
+    /// 老账号的 config_json 里没有这三个字段时的落点：续写默认关闭、预算沿用
+    /// 10 轮、失败照旧允许切号。
     #[test]
-    fn stream_continue_and_failover_default_to_the_previous_behaviour() {
+    fn stream_continue_and_failover_defaults_cover_accounts_without_the_keys() {
         let policy =
             RouteCredentialFailurePolicy::from_config_json(r#"{"base_url":"https://example.com"}"#);
-        assert!(policy.stream_continue_enabled);
+        assert!(!policy.stream_continue_enabled);
         assert_eq!(
             policy.stream_continue_max,
             DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX
@@ -626,7 +634,7 @@ mod tests {
             "failure_policy": { "retry_count": 4 }
         }))
         .expect("policy");
-        assert!(partial.stream_continue_enabled);
+        assert!(!partial.stream_continue_enabled);
         assert_eq!(
             partial.stream_continue_max,
             DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX
@@ -634,17 +642,18 @@ mod tests {
         assert!(partial.failover_enabled);
     }
 
+    /// 关掉是默认值，所以「打开」必须能被显式写出来并被读到。
     #[test]
-    fn stream_continue_and_failover_read_partial_account_overrides() {
+    fn an_account_can_opt_into_continuation_explicitly() {
         let policy = RouteCredentialFailurePolicy::from_config_value(&json!({
             "failure_policy": {
-                "stream_continue_enabled": false,
+                "stream_continue_enabled": true,
                 "stream_continue_max": 3,
                 "failover_enabled": false,
             }
         }))
         .expect("policy");
-        assert!(!policy.stream_continue_enabled);
+        assert!(policy.stream_continue_enabled);
         assert_eq!(policy.stream_continue_max, 3);
         assert!(!policy.failover_enabled);
     }

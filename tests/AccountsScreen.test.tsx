@@ -5892,10 +5892,11 @@ describe("AccountsScreen", () => {
 
     const continueToggle = screen.getByLabelText("断流后自动续写");
     const failoverToggle = screen.getByLabelText("失败后切换到池内其它账号");
-    expect(continueToggle).toBeChecked();
+    expect(continueToggle).not.toBeChecked();
     expect(failoverToggle).toBeChecked();
     expect(screen.getByLabelText("最多续写轮次")).toHaveValue(10);
 
+    await userEvent.click(continueToggle);
     fireEvent.change(screen.getByLabelText("最多续写轮次"), { target: { value: "3" } });
     await userEvent.click(failoverToggle);
     await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
@@ -5908,7 +5909,7 @@ describe("AccountsScreen", () => {
     expect(config.failure_policy.failover_enabled).toBe(false);
   });
 
-  it("keeps an account without the new keys on the previous continuation defaults", async () => {
+  it("leaves continuation off for an account without the new keys", async () => {
     vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[0]);
     renderScreen();
 
@@ -5919,7 +5920,7 @@ describe("AccountsScreen", () => {
     await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
     const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
     const config = JSON.parse(payload.config_json);
-    expect(config.failure_policy.stream_continue_enabled).toBe(true);
+    expect(config.failure_policy.stream_continue_enabled).toBe(false);
     expect(config.failure_policy.stream_continue_max).toBe(10);
     expect(config.failure_policy.failover_enabled).toBe(true);
   });

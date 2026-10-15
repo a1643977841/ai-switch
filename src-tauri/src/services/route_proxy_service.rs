@@ -18351,6 +18351,19 @@ data: [DONE]\n\n";
             .collect()
     }
 
+    /// 续写默认关闭，所以凡是验证续写本身的用例都必须显式打开它。两个账号都开：
+    /// 聚合模式下续写会换号，写在同一份配置里更好读（预算仍只归断流那个账号）。
+    async fn create_continuation_credentials(pool: &SqlitePool, upstream: &str) -> (String, String) {
+        let config = json!({
+            "interface_format": "openai-responses",
+            "failure_policy": { "stream_continue_enabled": true },
+        });
+        let first = create_proxy_api_credential_with_config(pool, "first", upstream, config.clone())
+            .await;
+        let second = create_proxy_api_credential_with_config(pool, "second", upstream, config).await;
+        (first, second)
+    }
+
     /// 文本流断在半句中间：网关换一个账号再发一次「继续」，把两段文字接回
     /// 同一条 response，客户端只看到一个 `response.created` 与一条收尾事件。
     #[tokio::test]
@@ -18371,20 +18384,7 @@ data: [DONE]\n\n";
             start_scripted_sse_upstream(vec![vec![FIRST], vec![SECOND]]).await;
         let pool = create_memory_pool().await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
-        let first = create_proxy_api_credential_with_config(
-            &pool,
-            "first",
-            &upstream,
-            json!({"interface_format": "openai-responses"}),
-        )
-        .await;
-        let second = create_proxy_api_credential_with_config(
-            &pool,
-            "second",
-            &upstream,
-            json!({"interface_format": "openai-responses"}),
-        )
-        .await;
+        let (first, second) = create_continuation_credentials(&pool, &upstream).await;
         RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
             .await
             .expect("pool members");
@@ -18489,11 +18489,15 @@ data: [DONE]\n\n";
         let pool = create_memory_pool().await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
         let mappings = json!([{"from": "gpt-6-astra", "to": "deepseek-chat"}]);
+        let config = json!({
+            "interface_format": "openai",
+            "model_mappings": mappings,
+            "failure_policy": { "stream_continue_enabled": true },
+        });
         let first =
-            create_proxy_api_credential_with_mappings(&pool, "first", &upstream, mappings.clone())
-                .await;
+            create_proxy_api_credential_with_config(&pool, "first", &upstream, config.clone()).await;
         let second =
-            create_proxy_api_credential_with_mappings(&pool, "second", &upstream, mappings).await;
+            create_proxy_api_credential_with_config(&pool, "second", &upstream, config).await;
         RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
             .await
             .expect("pool members");
@@ -18560,7 +18564,7 @@ data: [DONE]\n\n";
             &upstream,
             json!({
                 "interface_format": "openai-responses",
-                "failure_policy": { "stream_continue_max": 2 },
+                "failure_policy": { "stream_continue_enabled": true, "stream_continue_max": 2 },
             }),
         )
         .await;
@@ -18648,7 +18652,10 @@ data: [DONE]\n\n";
             &pool,
             "first",
             &first_upstream,
-            json!({"interface_format": "openai-responses"}),
+            json!({
+                "interface_format": "openai-responses",
+                "failure_policy": { "stream_continue_enabled": true },
+            }),
         )
         .await;
         let second = create_proxy_api_credential_with_config(
@@ -18727,7 +18734,7 @@ data: [DONE]\n\n";
             &first_upstream,
             json!({
                 "interface_format": "openai-responses",
-                "failure_policy": { "failover_enabled": false },
+                "failure_policy": { "stream_continue_enabled": true, "failover_enabled": false },
             }),
         )
         .await;
@@ -18779,9 +18786,10 @@ data: [DONE]\n\n";
         RouteProxyService::stop(&runtime).await.expect("stop proxy");
     }
 
-    /// 账号自己关掉续写：哪怕预算充足也不再问上游，按今天的断流路径收尾。
+    /// 续写默认关闭：没配过失败策略的老账号、以及显式写了 `false` 的账号，都
+    /// 不会再问上游——哪怕预算充足——直接按断流路径收尾。
     #[tokio::test]
-    async fn an_account_that_disables_continuation_is_never_reasked() {
+    async fn an_account_without_continuation_enabled_is_never_reasked() {
         use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
         use crate::database::{create_memory_pool, run_migrations};
 
@@ -18789,63 +18797,74 @@ data: [DONE]\n\n";
             data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
             data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"半句\"}\n\n";
 
-        let (upstream, calls) = start_scripted_sse_upstream(vec![vec![CUT]]).await;
-        let pool = create_memory_pool().await.expect("pool");
-        run_migrations(&pool).await.expect("migrations");
-        let first = create_proxy_api_credential_with_config(
-            &pool,
-            "first",
-            &upstream,
-            json!({
+        // 前者是默认值，后者是显式关掉且还留着预算——两种都不许续写。
+        let policies = [
+            json!({}),
+            json!({ "stream_continue_enabled": false, "stream_continue_max": 5 }),
+        ];
+        for policy in policies {
+            let (upstream, calls) = start_scripted_sse_upstream(vec![vec![CUT]]).await;
+            let pool = create_memory_pool().await.expect("pool");
+            run_migrations(&pool).await.expect("migrations");
+            let config = json!({
                 "interface_format": "openai-responses",
-                "failure_policy": { "stream_continue_enabled": false, "stream_continue_max": 5 },
-            }),
-        )
-        .await;
-        let second = create_proxy_api_credential_with_config(
-            &pool,
-            "second",
-            &upstream,
-            json!({"interface_format": "openai-responses"}),
-        )
-        .await;
-        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
-            .await
-            .expect("pool members");
-        let route_key =
-            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                "failure_policy": policy.clone(),
+            });
+            let first =
+                create_proxy_api_credential_with_config(&pool, "first", &upstream, config).await;
+            let second = create_proxy_api_credential_with_config(
+                &pool,
+                "second",
+                &upstream,
+                json!({
+                    "interface_format": "openai-responses",
+                    "failure_policy": { "stream_continue_enabled": true },
+                }),
+            )
+            .await;
+            RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
                 .await
-                .expect("route key");
-        let runtime = RouteProxyRuntimeState::default();
-        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
-            .await
-            .expect("start proxy");
+                .expect("pool members");
+            let route_key =
+                RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                    .await
+                    .expect("route key");
+            let runtime = RouteProxyRuntimeState::default();
+            let proxy =
+                RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+                    .await
+                    .expect("start proxy");
 
-        let response = reqwest::Client::new()
-            .post(format!(
-                "{}/v1/responses",
-                proxy.base_url.as_deref().expect("base url")
-            ))
-            .bearer_auth(route_key)
-            .json(&json!({
-                "model": "gpt-6-astra",
-                "stream": true,
-                "input": [{"type":"message","role":"user",
-                           "content":[{"type":"input_text","text":"hi"}]}]
-            }))
-            .send()
-            .await
-            .expect("proxy response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.text().await.expect("body");
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "{}/v1/responses",
+                    proxy.base_url.as_deref().expect("base url")
+                ))
+                .bearer_auth(route_key)
+                .json(&json!({
+                    "model": "gpt-6-astra",
+                    "stream": true,
+                    "input": [{"type":"message","role":"user",
+                               "content":[{"type":"input_text","text":"hi"}]}]
+                }))
+                .send()
+                .await
+                .expect("proxy response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.text().await.expect("body");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "关掉续写后不能再问上游");
-        assert!(
-            !body.contains("\"type\":\"response.completed\""),
-            "没续完就不该补假的收尾事件: {body}"
-        );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "续写关着就不能再问上游（{policy}）: {body}"
+            );
+            assert!(
+                !body.contains("\"type\":\"response.completed\""),
+                "没续完就不该补假的收尾事件: {body}"
+            );
 
-        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+            RouteProxyService::stop(&runtime).await.expect("stop proxy");
+        }
     }
 
     /// 重试预算用尽之后是否走池里的下一个账号，由失败账号自己的
@@ -18959,20 +18978,7 @@ data: [DONE]\n\n";
         .await;
         let pool = create_memory_pool().await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
-        let first = create_proxy_api_credential_with_config(
-            &pool,
-            "first",
-            &upstream,
-            json!({"interface_format": "openai-responses"}),
-        )
-        .await;
-        let second = create_proxy_api_credential_with_config(
-            &pool,
-            "second",
-            &upstream,
-            json!({"interface_format": "openai-responses"}),
-        )
-        .await;
+        let (first, second) = create_continuation_credentials(&pool, &upstream).await;
         RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
             .await
             .expect("pool members");
@@ -19040,20 +19046,7 @@ data: [DONE]\n\n";
             start_scripted_sse_upstream(vec![vec![FIRST], vec![SECOND]]).await;
         let pool = create_memory_pool().await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
-        let first = create_proxy_api_credential_with_config(
-            &pool,
-            "first",
-            &upstream,
-            json!({"interface_format": "openai-responses"}),
-        )
-        .await;
-        let second = create_proxy_api_credential_with_config(
-            &pool,
-            "second",
-            &upstream,
-            json!({"interface_format": "openai-responses"}),
-        )
-        .await;
+        let (first, second) = create_continuation_credentials(&pool, &upstream).await;
         RoutePoolRepository::replace_members(&pool, "codex", &[first.clone(), second.clone()])
             .await
             .expect("pool members");

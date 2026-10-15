@@ -261,7 +261,9 @@ The streaming path does not hand the response over as soon as the headers arrive
 
 ### After the first chunk: auto-continuation, and the failure is still recorded
 
-Once bytes are with the client they cannot be recalled, so a failure exposed after that point can no longer trigger a retry. Instead the gateway **re-asks itself**: it resends the original conversation plus the half-written answer and a continue instruction, and splices the result back into the same response — the client sees one normally completed turn and the user never has to type "continue". Whether that happens, and for how many rounds, is decided by the failure policy of **the account that disconnected** (see "Failure policy bounds" below).
+Once bytes are with the client they cannot be recalled, so a failure exposed after that point can no longer trigger a retry. **By default that is where it stops** — the truncation is visible and the user decides whether to ask for more.
+
+An account can opt into **auto-continuation**: the gateway resends the original conversation plus the half-written answer and a continue instruction, and splices the result back into the same response — the client sees one normally completed turn and the user never has to type "continue". Whether that happens, and for how many rounds, is decided by the failure policy of **the account that disconnected** (see "Failure policy bounds" below). It is off by default, because a continuation is a fully billed upstream call and what the client receives is not something the model wrote in one piece.
 
 Whether or not continuation succeeds, account health is still charged: if the stream ends having sent data frames but never a terminal event (`response.completed` / `[DONE]` / `message_stop` / `finish_reason: stop` / `finishReason: STOP`), it is recorded as a `semantic_response_transient` failure and enters the account's configured failure cooldown window. A successful continuation does not roll that record back — channel stability stats must not be diluted.
 
@@ -431,7 +433,7 @@ Retrying an auth failure only trips upstream abuse controls sooner, so it record
 | `retry_count` | 2 | 10 |
 | `retry_interval_ms` | 200 | 60000 |
 | `semantic_error_threshold` | 10 | 1000 (minimum 1; 0 is rejected) |
-| `stream_continue_enabled` | `true` | — (whether to auto-continue after a disconnect) |
+| `stream_continue_enabled` | `false` | — (whether to auto-continue after a disconnect) |
 | `stream_continue_max` | 10 | 10 (`0` means off) |
 | `failover_enabled` | `true` | — (whether failures may move on to another account in the pool) |
 

@@ -261,7 +261,9 @@ fn semantic_failure_fingerprint(response_status: Option<u16>, message: &str) -> 
 
 ### 首包之后的截断：自动续写，失败照记
 
-字节一旦发给客户端就收不回来，所以此后暴露的失败无法再换号重试。做法是**网关自己再问一次**：拿着"原会话 + 已生成的半截回答 + 一句继续指令"重新发起请求，把结果接回同一条 response——客户端只看到一轮正常完成的回答，用户不必手动再发一次"继续"。续写的开关与轮次由**断流的那个账号**自己的失败策略决定（见下方"失败策略的边界"）。
+字节一旦发给客户端就收不回来，所以此后暴露的失败无法再换号重试。**默认到此为止**——截断是可见的，用户自己决定要不要再发一次"继续"。
+
+账号可以开启**自动续写**：网关拿着"原会话 + 已生成的半截回答 + 一句继续指令"重新发起请求，把结果接回同一条 response——客户端只看到一轮正常完成的回答。续写的开关与轮次由**断流的那个账号**自己的失败策略决定（见下方"失败策略的边界"）。默认关闭，因为续写是一次完整的计费请求，而且交给客户端的是模型并非一次写成的答案。
 
 无论续写成功与否，**账号健康度照记**：流结束时如果发现"有数据帧却始终没有终止事件"（`response.completed` / `[DONE]` / `message_stop` / `finish_reason: stop` / `finishReason: STOP`），就按 `semantic_response_transient` 记一次失败，并按账号配置的失败冷却窗口退避。续写成功不会回滚这一次记账——渠道稳定性统计不能被稀释。
 
@@ -435,7 +437,7 @@ pub(crate) fn should_retry_same_credential_status(status: StatusCode) -> bool {
 | `retry_count` | 2 | 10 |
 | `retry_interval_ms` | 200 | 60000 |
 | `semantic_error_threshold` | 10 | 1000（下限 1，填 0 被拒） |
-| `stream_continue_enabled` | `true` | —（断流后是否自动续写） |
+| `stream_continue_enabled` | `false` | —（断流后是否自动续写） |
 | `stream_continue_max` | 10 | 10（`0` 等同于关闭） |
 | `failover_enabled` | `true` | —（失败后是否切到池内其它账号） |
 

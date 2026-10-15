@@ -155,11 +155,12 @@ async fn fixture_request(
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let pool = create_memory_pool().await.unwrap();
     run_migrations(&pool).await.unwrap();
-    // 续写预算记在断流的那个账号（first）上，不再由全局设置决定。
+    // 续写默认关闭，这批用例全部显式打开；预算记在断流的那个账号（first）上，
+    // 不再由全局设置决定。
     let base = json!({
         "interface_format":dialect,
         "responses_custom_tool_compat":true,
-        "failure_policy": { "stream_continue_max": budget },
+        "failure_policy": { "stream_continue_enabled": true, "stream_continue_max": budget },
     });
     let first = create_proxy_api_credential_with_config(
         &pool,

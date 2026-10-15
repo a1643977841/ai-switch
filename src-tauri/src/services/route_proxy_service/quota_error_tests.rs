@@ -63,7 +63,8 @@ async fn setup(
                 &format!("account-{i}"),
                 &upstream.url,
                 json!({"interface_format":"openai-responses","failure_policy":{
-                    "retry_count":4,"retry_interval_ms":0,"error_status_enabled":false
+                    "retry_count":4,"retry_interval_ms":0,"error_status_enabled":false,
+                    "stream_continue_enabled":true
                 }}),
             )
             .await,
