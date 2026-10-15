@@ -259,11 +259,13 @@ fn semantic_failure_fingerprint(response_status: Option<u16>, message: &str) -> 
 - 上游给了 200 却在首包前直接关流；
 - 首包本身就是个失败信封（网关常把错误放在开头那一帧）。
 
-### 首包之后的截断只记账，不重试
+### 首包之后的截断：自动续写，失败照记
 
-字节一旦发给客户端就收不回来，所以此后暴露的失败无法再换号。但**账号健康度照记**：流结束时如果发现"有数据帧却始终没有终止事件"（`response.completed` / `[DONE]` / `message_stop` / `finish_reason: stop` / `finishReason: STOP`），就按 `semantic_response_transient` 记一次失败，并按账号配置的失败冷却窗口退避。
+字节一旦发给客户端就收不回来，所以此后暴露的失败无法再换号重试。做法是**网关自己再问一次**：拿着"原会话 + 已生成的半截回答 + 一句继续指令"重新发起请求，把结果接回同一条 response——客户端只看到一轮正常完成的回答，用户不必手动再发一次"继续"。续写的开关与轮次由**断流的那个账号**自己的失败策略决定（见下方"失败策略的边界"）。
 
-判定用的终止标记与缓冲路径的 `stream_disconnected_before_completion` 逐字节一致，两条路的结论不会分叉。差别只在处置：缓冲路径能重试，流式路径只能记账——而这恰好会让下一次选号避开长期截断的上游。
+无论续写成功与否，**账号健康度照记**：流结束时如果发现"有数据帧却始终没有终止事件"（`response.completed` / `[DONE]` / `message_stop` / `finish_reason: stop` / `finishReason: STOP`），就按 `semantic_response_transient` 记一次失败，并按账号配置的失败冷却窗口退避。续写成功不会回滚这一次记账——渠道稳定性统计不能被稀释。
+
+判定用的终止标记与缓冲路径的 `stream_disconnected_before_completion` 逐字节一致，两条路的结论不会分叉。差别只在处置：缓冲路径能重试，流式路径只能续写加记账——而这恰好会让下一次选号避开长期截断的上游。
 
 ::: tip 用量不会因为流式而丢
 token 与费用是在流结束时结算的，客户端提前断开也一样会记——半截响应同样计入统计，而不是凭空消失。
@@ -414,7 +416,7 @@ let cooldown_seconds = policy.cooldown_enabled.then_some(policy.cooldown_seconds
 
 1. 读取账号的失败策略（`config_json.failure_policy`），拿到 `retry_count` 与 `retry_interval_ms`。
 2. 如果这个账号的重试次数还没用完，**等待 `retry_interval_ms` 后把它塞回队列头部**，也就是同号再试一次；这一次不写失败计数。
-3. 重试次数用完了，才记一次瞬时失败并顺延到下一个候选账号。
+3. 重试次数用完了，才记一次瞬时失败并顺延到下一个候选账号——**除非这个账号关掉了 `failover_enabled`**，那时请求到此为止，客户端拿到的是它自己的错误。
 
 **401 / 403 是例外：永不同号重试。** 判定就一行：
 
@@ -433,8 +435,16 @@ pub(crate) fn should_retry_same_credential_status(status: StatusCode) -> bool {
 | `retry_count` | 2 | 10 |
 | `retry_interval_ms` | 200 | 60000 |
 | `semantic_error_threshold` | 10 | 1000（下限 1，填 0 被拒） |
+| `stream_continue_enabled` | `true` | —（断流后是否自动续写） |
+| `stream_continue_max` | 10 | 10（`0` 等同于关闭） |
+| `failover_enabled` | `true` | —（失败后是否切到池内其它账号） |
 
 只写部分字段时，其余字段各自回落到默认值。整个 `failure_policy` 都不写就全用默认值。超范围的值在创建/更新账号时返回 `validation.route_credential_failure_policy`。
+
+这三个字段都是**按账号**生效的，因为断流是渠道属性：中转站会频繁断流，官方/直连渠道几乎不断。语义上有两条边界：
+
+1. **续写预算归断流的那个账号。** 换号只决定这一轮续写请求打给谁，被换到的账号的策略不参与本轮决策——否则两个账号的策略会互相引用，绕不出来。
+2. **`failover_enabled` 只在聚合模式有意义。** 精确模式下请求本来就钉在这个账号上，候选只有一个，开关天然是 no-op。关掉之后，重试用尽时客户端拿到的是本账号自己的错误，而不是一句聚合出来的"所有凭据都失败"。
 
 ## 冷却中的账号与模型怎么被跳过
 

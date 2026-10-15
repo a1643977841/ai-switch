@@ -27,6 +27,12 @@ export type RouteCredentialFailurePolicy = {
   cooldown_enabled: boolean;
   cooldown_seconds: number;
   error_status_enabled: boolean;
+  /** 流式上游中途断掉时是否由网关自动续写。 */
+  stream_continue_enabled: boolean;
+  /** 该账号允许的最大续写轮次；0 等同于关闭。 */
+  stream_continue_max: number;
+  /** 重试/续写都失败后，是否切到池内其它账号（仅聚合模式有效）。 */
+  failover_enabled: boolean;
 };
 
 export type PlatformId =
@@ -1177,8 +1183,6 @@ export type AppSettings = {
   proxy_url?: string | null;
   /** Model proxy request body limit in MiB. Defaults to 128; 0 disables the limit. */
   route_proxy_request_body_limit_mib?: number;
-  /** 流式断流时网关自动续写的最大轮次。默认 10；0 关闭续写。 */
-  route_proxy_stream_continue_max?: number;
 };
 
 export type AppSettingsView = AppSettings & {

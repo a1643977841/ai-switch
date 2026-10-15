@@ -172,6 +172,9 @@ SSE 是已提交的单向流：字节一旦转发给客户端就无法回滚重�
 
 ## 9. 预算与设置
 
+> 本节已被第 17 节取代：全局设置项已移除，续写与故障转移改由每个账号自己的
+> `failure_policy` 决定。
+
 - 新增设置项 `route_proxy_stream_continue_max`，**默认 10**，`0` 表示关闭续写；
 - 落点：`AppSettings` / `AppSettingsView`（`src-tauri/src/models/settings.rs`）
   + 设置界面（`src/screens/SettingsScreen.tsx`，与 `route_proxy_request_body_limit_mib` 同区）；
@@ -294,3 +297,33 @@ SSE 是已提交的单向流：字节一旦转发给客户端就无法回滚重�
 
 最终验证：Rust `cargo test --lib` 1933 通过、13 忽略；前端 941 通过；类型检查通过。
 所有新增 HTTP 上游均为本地测试服务，不消耗真实渠道配额。
+
+## 17. 续写开关与切号下沉到账号（2026-10-15）
+
+第 9 节的全局设置项 `route_proxy_stream_continue_max` 已移除，续写与故障转移改由
+**每个账号自己的 `failure_policy`** 决定（账号编辑 →「故障处理」标签页）。原因是
+断流是**渠道属性**：anyrouter 这类中转站会频繁断流，官方/直连渠道几乎不断——用一把
+全局开关要么误伤、要么不够。顺带补上了原本计划里写、实际漏做的前端控件。
+
+新增字段（`RouteCredentialFailurePolicy`，全部 `#[serde(default)]`；老账号不配置即
+落到默认值，行为与改动前完全一致）：
+
+| 字段 | 默认 | 作用 |
+| --- | --- | --- |
+| `stream_continue_enabled` | `true` | 该账号断流后是否自动续写 |
+| `stream_continue_max` | `10`（上限同为 10） | 该账号允许的续写轮次，0 等同于关闭 |
+| `failover_enabled` | `true` | 重试/续写都失败后是否切到池内其它账号 |
+
+语义边界：
+
+1. **预算归断流的那个账号**。续写开关与轮次只看断流账号自己的策略；换号只决定
+   这一轮续写请求打给谁，被换到的账号的策略不参与本轮决策——否则两个账号的策略
+   会互相引用，绕不出来。
+2. `failover_enabled = false` 时，重试次数用尽即清空重试队列，客户端拿到的是本
+   账号自己的错误（`All route credentials failed for codex: first: …`），而不是一句
+   聚合出来的失败；续写则只在同账号重试。精确模式下候选本来就只有一个，该开关
+   天然是 no-op。
+3. 断流重试的 500ms 延迟仍是硬编码常量 `STREAM_DISCONNECT_RETRY_DELAY`，不吃账号
+   的 `retry_interval_ms`——上游是在毫秒级就回的失败帧，策略级的退避（通常数秒）
+   代价比重试本身还高。
+4. 续写成功仍旧不回滚断流那一次的失败记账（第 15 节第 1 条）。

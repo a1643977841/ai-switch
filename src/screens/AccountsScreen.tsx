@@ -268,6 +268,10 @@ type RoutePoolMutationInput = {
 
 const DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_SECONDS = 10;
 const MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS = 86_400;
+// 断流自动续写：默认 10 轮，0 表示不续写。每一轮都是一次真实计费的上游请求，
+// 所以上限与 retry_count 同量级，不给放大空间。
+const DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX = 10;
+const MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX = 10;
 // One-click steps offered by the cooldown dialog. Both directions, because the
 // interesting adjustment is usually "wait less" — a rate-limit window that turned
 // out to be shorter than the configured one.
@@ -323,6 +327,9 @@ const defaultRouteCredentialFailurePolicy: RouteCredentialFailurePolicy = {
   cooldown_enabled: false,
   cooldown_seconds: DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_SECONDS,
   error_status_enabled: true,
+  stream_continue_enabled: true,
+  stream_continue_max: DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX,
+  failover_enabled: true,
 };
 
 const createTabs: Array<FormTab<CreateTab>> = [
@@ -1191,14 +1198,17 @@ function failurePolicyFromConfig(config: Record<string, unknown>): RouteCredenti
       | "retry_count"
       | "retry_interval_ms"
       | "semantic_error_threshold"
-      | "cooldown_seconds",
+      | "cooldown_seconds"
+      | "stream_continue_max",
   ) => {
     const value = record[key];
     return typeof value === "number" && Number.isInteger(value)
       ? value
       : defaultRouteCredentialFailurePolicy[key];
   };
-  const booleanOrDefault = (key: "cooldown_enabled" | "error_status_enabled") => {
+  const booleanOrDefault = (
+    key: "cooldown_enabled" | "error_status_enabled" | "stream_continue_enabled" | "failover_enabled",
+  ) => {
     const value = record[key];
     return typeof value === "boolean" ? value : defaultRouteCredentialFailurePolicy[key];
   };
@@ -1209,6 +1219,9 @@ function failurePolicyFromConfig(config: Record<string, unknown>): RouteCredenti
     cooldown_enabled: booleanOrDefault("cooldown_enabled"),
     cooldown_seconds: integerOrDefault("cooldown_seconds"),
     error_status_enabled: booleanOrDefault("error_status_enabled"),
+    stream_continue_enabled: booleanOrDefault("stream_continue_enabled"),
+    stream_continue_max: integerOrDefault("stream_continue_max"),
+    failover_enabled: booleanOrDefault("failover_enabled"),
   };
 }
 
@@ -3279,6 +3292,11 @@ export function AccountsScreen({
     String(DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_SECONDS),
   );
   const [editErrorStatusEnabled, setEditErrorStatusEnabled] = useState(true);
+  const [editStreamContinueEnabled, setEditStreamContinueEnabled] = useState(true);
+  const [editStreamContinueMax, setEditStreamContinueMax] = useState(
+    String(DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX),
+  );
+  const [editFailoverEnabled, setEditFailoverEnabled] = useState(true);
   const [editFailurePolicyError, setEditFailurePolicyError] = useState<string | null>(null);
   const [editRecoveryMode, setEditRecoveryMode] = useState<RecoveryMode>("off");
   const [editRecoveryTimes, setEditRecoveryTimes] = useState<string[]>([]);
@@ -3987,6 +4005,9 @@ export function AccountsScreen({
     setEditCooldownEnabled(failurePolicy.cooldown_enabled);
     setEditCooldownSeconds(String(failurePolicy.cooldown_seconds));
     setEditErrorStatusEnabled(failurePolicy.error_status_enabled);
+    setEditStreamContinueEnabled(failurePolicy.stream_continue_enabled);
+    setEditStreamContinueMax(String(failurePolicy.stream_continue_max));
+    setEditFailoverEnabled(failurePolicy.failover_enabled);
     setEditFailurePolicyError(null);
     setEditSecretJson(parseJsonPreview(editingCredential.secret_payload_json, editingCredential.secret_payload_json));
     setEditConfigJson(parseJsonPreview(editingCredential.config_json, editingCredential.config_json));
@@ -5149,6 +5170,7 @@ export function AccountsScreen({
       const retryIntervalMs = Number(editRetryIntervalMs);
       const semanticErrorThreshold = Number(editSemanticErrorThreshold);
       const cooldownSeconds = Number(editCooldownSeconds);
+      const streamContinueMax = Number(editStreamContinueMax);
       let failurePolicyError: string | null = null;
       if (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 10) {
         failurePolicyError = "额外重试次数必须是 0-10 的整数";
@@ -5170,6 +5192,12 @@ export function AccountsScreen({
         cooldownSeconds > MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS
       ) {
         failurePolicyError = `失败冷却需在 1 到 ${MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS} 秒之间。`;
+      } else if (
+        !Number.isInteger(streamContinueMax) ||
+        streamContinueMax < 0 ||
+        streamContinueMax > MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX
+      ) {
+        failurePolicyError = `最多续写轮次必须是 0-${MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX} 的整数`;
       }
       if (failurePolicyError) {
         setEditFailurePolicyError(failurePolicyError);
@@ -5183,6 +5211,9 @@ export function AccountsScreen({
         cooldown_enabled: editCooldownEnabled,
         cooldown_seconds: cooldownSeconds,
         error_status_enabled: editErrorStatusEnabled,
+        stream_continue_enabled: editStreamContinueEnabled,
+        stream_continue_max: streamContinueMax,
+        failover_enabled: editFailoverEnabled,
       };
       setEditFailurePolicyError(null);
       setEditModelMappingsError(null);
@@ -9708,6 +9739,66 @@ export function AccountsScreen({
                           </span>
                         </span>
                       </label>
+                    </div>
+                    <div className="mt-3 rounded-lg border border-stone-200 bg-white/70 p-3">
+                      <p className="text-[12px] font-semibold text-stone-900">流式断流</p>
+                      <p className="mt-0.5 text-[11px] text-stone-500">
+                        上游已经吐出内容却没发出收尾标记时出现（客户端看到 stream disconnected before
+                        completion）。
+                      </p>
+                      <div className="mt-2.5 grid gap-2">
+                        <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
+                          <input
+                            aria-label="断流后自动续写"
+                            checked={editStreamContinueEnabled}
+                            className="mt-0.5"
+                            onChange={(event) => {
+                              setEditStreamContinueEnabled(event.target.checked);
+                              setEditFailurePolicyError(null);
+                            }}
+                            type="checkbox"
+                          />
+                          <span>
+                            <span className="font-semibold">断流后自动续写</span>
+                            <span className="block text-[11px] text-stone-600">
+                              字节已经发给客户端、无法回滚重试，所以由网关拿着「原会话 + 半截回答 +
+                              继续指令」再问一次，把结果接回同一条响应，客户端只看到一轮正常完成的回答。默认开启。
+                            </span>
+                          </span>
+                        </label>
+                        <label className={labelClass}>
+                          最多续写轮次
+                          <input
+                            aria-label="最多续写轮次"
+                            className={fieldClass}
+                            disabled={!editStreamContinueEnabled}
+                            max={MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX}
+                            min={0}
+                            onChange={(event) => {
+                              setEditStreamContinueMax(event.target.value);
+                              setEditFailurePolicyError(null);
+                            }}
+                            step={1}
+                            type="number"
+                            value={editStreamContinueMax}
+                          />
+                        </label>
+                        <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
+                          <input
+                            aria-label="失败后切换到池内其它账号"
+                            checked={editFailoverEnabled}
+                            className="mt-0.5"
+                            onChange={(event) => setEditFailoverEnabled(event.target.checked)}
+                            type="checkbox"
+                          />
+                          <span>
+                            <span className="font-semibold">失败后切换到池内其它账号</span>
+                            <span className="block text-[11px] text-stone-600">
+                              重试次数用尽、或续写仍然断流时，是否换池里的下一个账号继续。默认开启——这正是池的价值。关闭后客户端拿到的是本账号自己的错误，而不是一句聚合的「所有凭据都失败」。仅聚合模式有效；精确模式下请求本来就钉在这个账号上。
+                            </span>
+                          </span>
+                        </label>
+                      </div>
                     </div>
                     <div className="mt-3 grid gap-2 text-[11px] leading-5 text-stone-600">
                       <p>

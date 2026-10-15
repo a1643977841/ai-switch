@@ -259,11 +259,13 @@ The streaming path does not hand the response over as soon as the headers arrive
 - the upstream returns 200 and then closes without sending any body;
 - the first chunk is itself a failure envelope (gateways commonly put the error in the opening frame).
 
-### After the first chunk, truncation is recorded but not retried
+### After the first chunk: auto-continuation, and the failure is still recorded
 
-Once bytes are with the client they cannot be recalled, so a failure exposed after that point can no longer trigger failover. Account health is still charged, though: if the stream ends having sent data frames but never a terminal event (`response.completed` / `[DONE]` / `message_stop` / `finish_reason: stop` / `finishReason: STOP`), it is recorded as a `semantic_response_transient` failure and enters the account's configured failure cooldown window.
+Once bytes are with the client they cannot be recalled, so a failure exposed after that point can no longer trigger a retry. Instead the gateway **re-asks itself**: it resends the original conversation plus the half-written answer and a continue instruction, and splices the result back into the same response — the client sees one normally completed turn and the user never has to type "continue". Whether that happens, and for how many rounds, is decided by the failure policy of **the account that disconnected** (see "Failure policy bounds" below).
 
-The terminal markers are byte-identical to the buffered path's `stream_disconnected_before_completion`, so the two paths never reach different verdicts. Only the disposition differs: the buffered path can retry, the streaming path can only record — and recording is what makes the next selection avoid a chronically truncating upstream.
+Whether or not continuation succeeds, account health is still charged: if the stream ends having sent data frames but never a terminal event (`response.completed` / `[DONE]` / `message_stop` / `finish_reason: stop` / `finishReason: STOP`), it is recorded as a `semantic_response_transient` failure and enters the account's configured failure cooldown window. A successful continuation does not roll that record back — channel stability stats must not be diluted.
+
+The terminal markers are byte-identical to the buffered path's `stream_disconnected_before_completion`, so the two paths never reach different verdicts. Only the disposition differs: the buffered path can retry, the streaming path continues and records — and recording is what makes the next selection avoid a chronically truncating upstream.
 
 ::: tip Usage is not lost to streaming
 Tokens and cost are settled when the stream ends, including when the client disconnects early — a half-delivered response still counts toward the stats rather than vanishing.
@@ -410,7 +412,7 @@ A failure does not necessarily mean switching accounts immediately. The forwardi
 
 1. Read the account's failure policy (`config_json.failure_policy`) for `retry_count` and `retry_interval_ms`.
 2. If this account still has retries left, **wait `retry_interval_ms` and push it back to the head of the queue** — the same account tries again, and this attempt does not record a failure.
-3. Only once the retries are exhausted does it record one transient failure and move on to the next candidate.
+3. Only once the retries are exhausted does it record one transient failure and move on to the next candidate — **unless the account has `failover_enabled` turned off**, in which case the request stops there and the client gets that account's own error.
 
 **401 / 403 are the exception: never retried on the same credential.** The rule is one line:
 
@@ -429,8 +431,16 @@ Retrying an auth failure only trips upstream abuse controls sooner, so it record
 | `retry_count` | 2 | 10 |
 | `retry_interval_ms` | 200 | 60000 |
 | `semantic_error_threshold` | 10 | 1000 (minimum 1; 0 is rejected) |
+| `stream_continue_enabled` | `true` | — (whether to auto-continue after a disconnect) |
+| `stream_continue_max` | 10 | 10 (`0` means off) |
+| `failover_enabled` | `true` | — (whether failures may move on to another account in the pool) |
 
 Supplying only some fields leaves the rest at their defaults. Omitting `failure_policy` entirely uses all defaults. Out-of-range values return `validation.route_credential_failure_policy` when creating or updating an account.
+
+All three are **per account**, because disconnecting is a property of the channel: relays disconnect often, first-party and direct endpoints almost never. Two semantic boundaries:
+
+1. **The continuation budget belongs to the account that disconnected.** Switching accounts only decides who serves that one continuation request; the account switched *to* does not get a say — otherwise two accounts' policies would reference each other.
+2. **`failover_enabled` only means something in aggregate mode.** In precise mode the request is pinned to this account and there is only one candidate, so the switch is a no-op. With it off, an exhausted retry budget surfaces this account's own error instead of an aggregated "all route credentials failed".
 
 ## How cooling accounts and models get skipped
 

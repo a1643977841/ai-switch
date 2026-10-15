@@ -155,25 +155,30 @@ async fn fixture_request(
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let pool = create_memory_pool().await.unwrap();
     run_migrations(&pool).await.unwrap();
+    // 续写预算记在断流的那个账号（first）上，不再由全局设置决定。
+    let base = json!({
+        "interface_format":dialect,
+        "responses_custom_tool_compat":true,
+        "failure_policy": { "stream_continue_max": budget },
+    });
     let first = create_proxy_api_credential_with_config(
         &pool,
         "first",
         &upstream,
-        json!({"interface_format":dialect,"responses_custom_tool_compat":true}),
+        base.clone(),
     )
     .await;
     let second = create_proxy_api_credential_with_config(
         &pool,
         "second",
         &upstream,
-        json!({"interface_format":dialect,"responses_custom_tool_compat":true}),
+        base,
     )
     .await;
     RoutePoolRepository::replace_members(&pool, "codex", &[first.clone(), second.clone()])
         .await
         .unwrap();
     let runtime = RouteProxyRuntimeState::default();
-    runtime.set_stream_continue_max(budget);
     let state = build_proxy_state(pool, &runtime)
         .with_access_scope(PlatformId::Codex, HashSet::from([first, second]));
     let response = proxy_handler(

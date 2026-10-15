@@ -5883,6 +5883,61 @@ describe("AccountsScreen", () => {
     expect(updateRouteCredential).not.toHaveBeenCalled();
   });
 
+  it("saves the stream continuation and failover switches into the failure policy", async () => {
+    vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[0]);
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("故障处理");
+
+    const continueToggle = screen.getByLabelText("断流后自动续写");
+    const failoverToggle = screen.getByLabelText("失败后切换到池内其它账号");
+    expect(continueToggle).toBeChecked();
+    expect(failoverToggle).toBeChecked();
+    expect(screen.getByLabelText("最多续写轮次")).toHaveValue(10);
+
+    fireEvent.change(screen.getByLabelText("最多续写轮次"), { target: { value: "3" } });
+    await userEvent.click(failoverToggle);
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
+    const config = JSON.parse(payload.config_json);
+    expect(config.failure_policy.stream_continue_enabled).toBe(true);
+    expect(config.failure_policy.stream_continue_max).toBe(3);
+    expect(config.failure_policy.failover_enabled).toBe(false);
+  });
+
+  it("keeps an account without the new keys on the previous continuation defaults", async () => {
+    vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[0]);
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("故障处理");
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
+    const config = JSON.parse(payload.config_json);
+    expect(config.failure_policy.stream_continue_enabled).toBe(true);
+    expect(config.failure_policy.stream_continue_max).toBe(10);
+    expect(config.failure_policy.failover_enabled).toBe(true);
+  });
+
+  it("rejects a continuation budget above the per-account ceiling", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("故障处理");
+    fireEvent.change(screen.getByLabelText("最多续写轮次"), { target: { value: "11" } });
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(
+      (await screen.findAllByText("最多续写轮次必须是 0-10 的整数")).length,
+    ).toBeGreaterThan(0);
+    expect(updateRouteCredential).not.toHaveBeenCalled();
+  });
+
   it("shows the transient failure count as its own status tag until a request succeeds", async () => {
     vi.mocked(listRouteCredentials).mockResolvedValue([
       { ...credentialsFixture[0], transient_failure_count: 3 },

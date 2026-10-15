@@ -76,7 +76,6 @@ async fn setup(
         .await
         .unwrap();
     let runtime = RouteProxyRuntimeState::default();
-    runtime.set_stream_continue_max(2);
     let state = build_proxy_state(pool.clone(), &runtime)
         .with_access_scope(PlatformId::Codex, ids.iter().cloned().collect());
     (pool, state, ids)

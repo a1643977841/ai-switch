@@ -12,9 +12,7 @@ use crate::models::route_credential_model::{
     FailureScope, RouteCredentialModelState, MODEL_STATUS_OK,
 };
 use crate::models::route_pool::RouteUsageBreakdown;
-use crate::models::settings::{
-    DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB, DEFAULT_ROUTE_PROXY_STREAM_CONTINUE_MAX,
-};
+use crate::models::settings::DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB;
 use crate::services::anthropic_thinking::strip_replayed_thinking_from_bytes;
 use crate::services::client_identity;
 use crate::services::codex_reasoning_cache::CodexReasoningCache;
@@ -153,6 +151,18 @@ const TEXT_ONLY_CHAT_CONTENT_MESSAGE: &str = "当前会话包含多模态内容�
 async fn wait_for_credential_retry(policy: RouteCredentialFailurePolicy) {
     if policy.retry_interval_ms > 0 {
         tokio::time::sleep(Duration::from_millis(policy.retry_interval_ms.into())).await;
+    }
+}
+
+/// 账号关掉故障转移后，它自己的失败就是这次请求的最终答案。
+///
+/// 默认行为是记账后继续试池里的下一个账号——聚合模式下这就是「切号」，也正是
+/// 池的价值所在。关掉之后清空重试队列：循环随即退出，客户端拿到的是这个账号
+/// 自己的错误，而不是一句聚合出来的「所有凭据都失败」。精确模式下候选本来就
+/// 只有一个，这里清空与否都没有区别。
+fn stop_failover_when_disabled(retry_queue: &mut VecDeque<(usize, usize)>, failover_enabled: bool) {
+    if !failover_enabled {
+        retry_queue.clear();
     }
 }
 
@@ -324,8 +334,6 @@ pub struct RouteProxyRuntimeState {
     activity: RouteCredentialActivityRegistry,
     live_log: RouteProxyLiveLog,
     request_body_limit_mib: Arc<AtomicU32>,
-    /// 流式断流自动续写的最大轮次；0 关闭。与 body limit 一样由设置保存时刷新。
-    stream_continue_max: Arc<AtomicU32>,
 }
 
 impl Default for RouteProxyRuntimeState {
@@ -336,9 +344,6 @@ impl Default for RouteProxyRuntimeState {
             live_log: RouteProxyLiveLog::default(),
             request_body_limit_mib: Arc::new(AtomicU32::new(
                 DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB,
-            )),
-            stream_continue_max: Arc::new(AtomicU32::new(
-                DEFAULT_ROUTE_PROXY_STREAM_CONTINUE_MAX,
             )),
         }
     }
@@ -443,8 +448,6 @@ pub(crate) struct ProxyAppState {
     upstream_timeouts: OutboundTimeouts,
     /// Shared with the runtime so saving settings affects existing listeners.
     request_body_limit_mib: Arc<AtomicU32>,
-    /// 流式断流自动续写预算，同样与运行态共享。
-    stream_continue_max: Arc<AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -490,10 +493,6 @@ struct RouteProxyKeyCache {
 impl RouteProxyRuntimeState {
     pub fn set_request_body_limit_mib(&self, limit_mib: u32) {
         self.request_body_limit_mib.store(limit_mib, Ordering::Relaxed);
-    }
-
-    pub fn set_stream_continue_max(&self, max: u32) {
-        self.stream_continue_max.store(max, Ordering::Relaxed);
     }
 
     pub fn activity(&self) -> RouteCredentialActivityRegistry {
@@ -555,7 +554,6 @@ pub(crate) fn build_proxy_state(
         codex_history: CodexReasoningCache::default(),
         upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
         request_body_limit_mib: runtime.request_body_limit_mib.clone(),
-        stream_continue_max: runtime.stream_continue_max.clone(),
     }
 }
 
@@ -1458,6 +1456,7 @@ pub(crate) async fn forward_request(
                     )
                     .await;
                     retry_errors.push(error_message);
+                    stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
                 }
                 continue;
             }
@@ -1725,6 +1724,7 @@ pub(crate) async fn forward_request(
                     )
                     .await;
                     retry_errors.push(error_message);
+                    stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
                 }
                 continue;
             }
@@ -2069,6 +2069,7 @@ pub(crate) async fn forward_request(
             }
             retry_errors.push(format!("{}: {}", credential.display_name,
                 semantic_failure.as_ref().map(|failure| failure.message.as_str()).unwrap_or("upstream quota exhausted")));
+            stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
             continue;
         }
         // A key that is missing a scope is refused for every model on it, and no
@@ -2127,6 +2128,7 @@ pub(crate) async fn forward_request(
                 )
                 .await;
                 retry_errors.push(format!("{}: {}", credential.display_name, failure.message));
+                stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
             }
             continue;
         }
@@ -2149,6 +2151,7 @@ pub(crate) async fn forward_request(
                 )
                 .await;
                 retry_errors.push(format!("{}: {error_message}", credential.display_name));
+                stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
             }
             continue;
         }
@@ -2171,6 +2174,7 @@ pub(crate) async fn forward_request(
                 credential.display_name,
                 status.as_u16()
             ));
+            stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
             continue;
         }
 
@@ -3125,6 +3129,7 @@ async fn handle_stream_prime_failure(
         )
         .await;
         retry_errors.push(error_message.to_string());
+        stop_failover_when_disabled(retry_queue, failure_policy.failover_enabled);
     }
 }
 
@@ -3753,11 +3758,27 @@ impl StreamPump {
             return false;
         }
         // 先把施工图与重建请求所需的事实从 completion 里取出，借用随即结束。
-        let Some((plan, state, platform, path, query, headers, current_id)) = ({
+        let Some((
+            plan,
+            state,
+            platform,
+            path,
+            query,
+            headers,
+            current_id,
+            failover_enabled,
+        )) = ({
             let Some(completion) = self.guard.completion.as_ref() else {
                 return false;
             };
-            if self.rounds >= completion.state.stream_continue_max.load(Ordering::Relaxed) {
+            // 续写开关与预算属于断流的那个账号：它决定「要不要续写、最多续几轮」。
+            // 换号只决定这一轮续写请求打给谁——被换到的账号的策略不参与本轮决策，
+            // 否则两个账号的策略会互相引用，绕不出来。
+            let policy =
+                RouteCredentialFailurePolicy::from_config_json(&completion.credential.config_json);
+            if !policy.stream_continue_enabled
+                || self.rounds >= policy.stream_continue_max
+            {
                 return false;
             }
             plan_continuation(
@@ -3776,6 +3797,7 @@ impl StreamPump {
                     completion.upstream_query.clone(),
                     completion.client_headers.clone(),
                     completion.credential.id.clone(),
+                    policy.failover_enabled,
                 )
             })
         }) else {
@@ -3784,8 +3806,14 @@ impl StreamPump {
 
         let mut rejected = HashSet::new();
         let (credential, status, stream, resume_bridge, resume_custom_tools) = 'candidates: loop {
-            let Some(credential) =
-                pick_continuation_credential(&state, &platform, &current_id, &rejected).await
+            let Some(credential) = pick_continuation_credential(
+                &state,
+                &platform,
+                &current_id,
+                failover_enabled,
+                &rejected,
+            )
+            .await
             else {
                 return false;
             };
@@ -4236,11 +4264,12 @@ fn observed_upstream_stream(
 /// 选一个账号来做这一轮续写。
 ///
 /// 聚合模式允许换账号（排除当前这个，尽量换一条通道）；精确模式只允许同账号
-/// 重试（spec 第 6 节）。
+/// 重试（spec 第 6 节）。断流账号关掉故障转移时，聚合模式也退回只试自己。
 async fn pick_continuation_credential(
     state: &ProxyAppState,
     platform: &str,
     current_id: &str,
+    failover_enabled: bool,
     rejected: &HashSet<String>,
 ) -> Option<SelectedCredential> {
     let mode = RoutePoolRepository::model_mode(&state.pool, platform)
@@ -4253,6 +4282,9 @@ async fn pick_continuation_credential(
         .filter(|credential| credential.kind == "api" && !rejected.contains(&credential.id));
     match mode {
         PoolModelMode::Precise => candidates
+            .into_iter()
+            .find(|candidate| candidate.id == current_id),
+        PoolModelMode::Aggregate if !failover_enabled => candidates
             .into_iter()
             .find(|candidate| candidate.id == current_id),
         PoolModelMode::Aggregate => candidates
@@ -15252,7 +15284,6 @@ data: [DONE]\n\n";
             codex_history: CodexReasoningCache::default(),
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
-            stream_continue_max: RouteProxyRuntimeState::default().stream_continue_max,
         };
 
         let mut headers = HeaderMap::new();
@@ -15288,7 +15319,6 @@ data: [DONE]\n\n";
             codex_history: CodexReasoningCache::default(),
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
-            stream_continue_max: RouteProxyRuntimeState::default().stream_continue_max,
         };
 
         let error = resolve_platform(&state, &HeaderMap::new(), None)
@@ -15319,7 +15349,6 @@ data: [DONE]\n\n";
             codex_history: CodexReasoningCache::default(),
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
-            stream_continue_max: RouteProxyRuntimeState::default().stream_continue_max,
         };
 
         let key = "sk-invalid";
@@ -18524,11 +18553,15 @@ data: [DONE]\n\n";
         let (upstream, calls) = start_scripted_sse_upstream(vec![vec![CUT]]).await;
         let pool = create_memory_pool().await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
+        // 预算记在断流的那个账号（first）上：续写换号只决定请求打给谁。
         let first = create_proxy_api_credential_with_config(
             &pool,
             "first",
             &upstream,
-            json!({"interface_format": "openai-responses"}),
+            json!({
+                "interface_format": "openai-responses",
+                "failure_policy": { "stream_continue_max": 2 },
+            }),
         )
         .await;
         let second = create_proxy_api_credential_with_config(
@@ -18546,7 +18579,6 @@ data: [DONE]\n\n";
                 .await
                 .expect("route key");
         let runtime = RouteProxyRuntimeState::default();
-        runtime.set_stream_continue_max(2);
         let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
             .await
             .expect("start proxy");
@@ -18588,6 +18620,313 @@ data: [DONE]\n\n";
         );
 
         RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 聚合模式默认换号续写：断流账号的上游只被问了一次，续写落在另一个账号的
+    /// 上游。两个账号各自指向不同的假上游，所以「有没有换号」直接可读。
+    #[tokio::test]
+    async fn continuation_moves_to_another_account_by_default() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CUT: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"半句\"}\n\n";
+        const FULL: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r2\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m9\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m9\",\"delta\":\"接上了\"}\n\n\
+            data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"m9\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"接上了\"}]}}\n\n\
+            data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"r2\",\"status\":\"completed\"}}\n\n";
+
+        let (first_upstream, first_calls) =
+            start_scripted_sse_upstream(vec![vec![CUT]]).await;
+        let (second_upstream, second_calls) =
+            start_scripted_sse_upstream(vec![vec![FULL]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first = create_proxy_api_credential_with_config(
+            &pool,
+            "first",
+            &first_upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        let second = create_proxy_api_credential_with_config(
+            &pool,
+            "second",
+            &second_upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1, "断流只问一次");
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            1,
+            "默认应当换号续写: {body}"
+        );
+        assert!(body.contains("接上了"), "续写正文没接上: {body}");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 同一场景，但断流账号关掉了故障转移：续写只在自己身上重试，另一个账号的
+    /// 上游一次都不会被打到。
+    #[tokio::test]
+    async fn continuation_stays_on_the_same_account_when_failover_is_off() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CUT: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"半句\"}\n\n";
+        const FULL: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r2\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m9\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m9\",\"delta\":\"接上了\"}\n\n\
+            data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"m9\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"接上了\"}]}}\n\n\
+            data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"r2\",\"status\":\"completed\"}}\n\n";
+
+        let (first_upstream, first_calls) =
+            start_scripted_sse_upstream(vec![vec![CUT], vec![FULL]]).await;
+        let (second_upstream, second_calls) =
+            start_scripted_sse_upstream(vec![vec![FULL]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first = create_proxy_api_credential_with_config(
+            &pool,
+            "first",
+            &first_upstream,
+            json!({
+                "interface_format": "openai-responses",
+                "failure_policy": { "failover_enabled": false },
+            }),
+        )
+        .await;
+        let second = create_proxy_api_credential_with_config(
+            &pool,
+            "second",
+            &second_upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert_eq!(first_calls.load(Ordering::SeqCst), 2, "续写必须落在自己身上");
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "关掉故障转移后不许换号: {body}"
+        );
+        assert!(body.contains("接上了"), "续写正文没接上: {body}");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 账号自己关掉续写：哪怕预算充足也不再问上游，按今天的断流路径收尾。
+    #[tokio::test]
+    async fn an_account_that_disables_continuation_is_never_reasked() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CUT: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"半句\"}\n\n";
+
+        let (upstream, calls) = start_scripted_sse_upstream(vec![vec![CUT]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first = create_proxy_api_credential_with_config(
+            &pool,
+            "first",
+            &upstream,
+            json!({
+                "interface_format": "openai-responses",
+                "failure_policy": { "stream_continue_enabled": false, "stream_continue_max": 5 },
+            }),
+        )
+        .await;
+        let second = create_proxy_api_credential_with_config(
+            &pool,
+            "second",
+            &upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "关掉续写后不能再问上游");
+        assert!(
+            !body.contains("\"type\":\"response.completed\""),
+            "没续完就不该补假的收尾事件: {body}"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 重试预算用尽之后是否走池里的下一个账号，由失败账号自己的
+    /// `failover_enabled` 决定：开着就切号，关着就把这个账号的错误原样交给客户端。
+    #[tokio::test]
+    async fn failover_switch_decides_whether_the_pool_walks_on_after_retries() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const DOWN: &str = r#"{"error":{"message":"upstream down"}}"#;
+        const OK_BODY: &str = r#"{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+
+        for failover_enabled in [true, false] {
+            let (failing, failing_calls) =
+                start_status_sequence_upstream(usize::MAX, StatusCode::BAD_GATEWAY, DOWN, OK_BODY)
+                    .await;
+            let (healthy, healthy_calls) =
+                start_status_sequence_upstream(0, StatusCode::BAD_GATEWAY, DOWN, OK_BODY).await;
+            let pool = create_memory_pool().await.expect("pool");
+            run_migrations(&pool).await.expect("migrations");
+            let first = create_proxy_api_credential_with_config(
+                &pool,
+                "first",
+                &failing,
+                json!({"failure_policy": {"retry_count": 0, "failover_enabled": failover_enabled}}),
+            )
+            .await;
+            let second = create_proxy_api_credential(&pool, "second", &healthy).await;
+            RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+                .await
+                .expect("pool members");
+            let key =
+                RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-failover-switch")
+                    .await
+                    .expect("route key");
+            let runtime = RouteProxyRuntimeState::default();
+            let state = build_proxy_state(pool.clone(), &runtime);
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {key}")).unwrap(),
+            );
+            let response = proxy_handler(
+                AxumState(state),
+                Method::POST,
+                headers,
+                "/v1/chat/completions".parse().unwrap(),
+                Body::from(json!({"model":"gpt-5.5","messages":[]}).to_string()),
+            )
+            .await;
+            let status = response.status();
+            let body = String::from_utf8_lossy(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .expect("body"),
+            )
+            .to_string();
+
+            assert_eq!(
+                failing_calls.load(Ordering::SeqCst),
+                1,
+                "第一个账号只该被问一次"
+            );
+            if failover_enabled {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(
+                    healthy_calls.load(Ordering::SeqCst),
+                    1,
+                    "开着就该切号: {body}"
+                );
+            } else {
+                assert!(status.is_server_error(), "关掉后应当是失败响应: {body}");
+                assert!(body.contains("first"), "错误要点名失败的账号: {body}");
+                assert!(!body.contains("second"), "不该牵扯没打过的账号: {body}");
+                assert_eq!(
+                    healthy_calls.load(Ordering::SeqCst),
+                    0,
+                    "关掉故障转移后不许切号: {body}"
+                );
+            }
+        }
     }
 
     /// 断点落在工具调用参数中间：半截调用客户端从未见过，整条丢弃，再打一轮

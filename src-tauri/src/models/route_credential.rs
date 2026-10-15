@@ -28,6 +28,21 @@ pub const MAX_ROUTE_CREDENTIAL_RETRY_COUNT: u32 = 10;
 pub const MAX_ROUTE_CREDENTIAL_RETRY_INTERVAL_MS: u32 = 60_000;
 pub const MAX_ROUTE_CREDENTIAL_SEMANTIC_ERROR_THRESHOLD: u32 = 1_000;
 pub const MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS: u32 = 86_400;
+/// Whether the gateway re-asks the upstream after a stream that delivered data
+/// but never terminated. On by default: the alternative is handing the client a
+/// half-written answer.
+pub const DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_ENABLED: bool = true;
+/// How many continuation rounds one account may spend on a single client
+/// request. Every round is a real, billed upstream call, so the ceiling is kept
+/// in the same 0–10 band as `retry_count`.
+pub const DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX: u32 = 10;
+pub const MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX: u32 = 10;
+/// Whether a failure may move the request to another account in the pool. On by
+/// default — it is what makes a pool worth having — but some setups would
+/// rather surface the failing account's own error than answer from a different
+/// credential (a pooled conversation whose reasoning was minted elsewhere is
+/// refused outright, and cost is easier to attribute per account).
+pub const DEFAULT_ROUTE_CREDENTIAL_FAILOVER_ENABLED: bool = true;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -38,6 +53,13 @@ pub struct RouteCredentialFailurePolicy {
     pub cooldown_enabled: bool,
     pub cooldown_seconds: u32,
     pub error_status_enabled: bool,
+    /// 流式上游中途断掉时，是否由网关自动续写（把结果接回同一条 response）。
+    pub stream_continue_enabled: bool,
+    /// 该账号允许的最大续写轮次；0 等同于关闭。
+    pub stream_continue_max: u32,
+    /// 重试/续写都失败后，是否切到池内其它账号。仅聚合模式有意义——精确模式下
+    /// 候选本来只有这一个账号。
+    pub failover_enabled: bool,
 }
 
 impl Default for RouteCredentialFailurePolicy {
@@ -49,6 +71,9 @@ impl Default for RouteCredentialFailurePolicy {
             cooldown_enabled: DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_ENABLED,
             cooldown_seconds: DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_SECONDS,
             error_status_enabled: DEFAULT_ROUTE_CREDENTIAL_ERROR_STATUS_ENABLED,
+            stream_continue_enabled: DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_ENABLED,
+            stream_continue_max: DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX,
+            failover_enabled: DEFAULT_ROUTE_CREDENTIAL_FAILOVER_ENABLED,
         }
     }
 }
@@ -94,6 +119,11 @@ impl RouteCredentialFailurePolicy {
         {
             return Err(format!(
                 "semantic_error_threshold must be between 1 and {MAX_ROUTE_CREDENTIAL_SEMANTIC_ERROR_THRESHOLD}"
+            ));
+        }
+        if self.stream_continue_max > MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX {
+            return Err(format!(
+                "stream_continue_max must be between 0 and {MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX}"
             ));
         }
         Ok(())
@@ -498,7 +528,9 @@ mod tests {
     use super::{
         RouteCredentialFailurePolicy, DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_SECONDS,
         DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT, DEFAULT_ROUTE_CREDENTIAL_RETRY_INTERVAL_MS,
-        DEFAULT_ROUTE_CREDENTIAL_SEMANTIC_ERROR_THRESHOLD, MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS,
+        DEFAULT_ROUTE_CREDENTIAL_SEMANTIC_ERROR_THRESHOLD,
+        DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX, MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS,
+        MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX,
     };
     use serde_json::json;
 
@@ -575,5 +607,63 @@ mod tests {
         .expect_err("invalid policy");
 
         assert!(error.contains("semantic_error_threshold"));
+    }
+
+    /// 老账号的 config_json 里没有这三个字段，必须落到默认值：续写照旧开着、
+    /// 预算照旧 10 轮、失败照旧允许切号——否则这次改动会静默改掉线上行为。
+    #[test]
+    fn stream_continue_and_failover_default_to_the_previous_behaviour() {
+        let policy =
+            RouteCredentialFailurePolicy::from_config_json(r#"{"base_url":"https://example.com"}"#);
+        assert!(policy.stream_continue_enabled);
+        assert_eq!(
+            policy.stream_continue_max,
+            DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX
+        );
+        assert!(policy.failover_enabled);
+
+        let partial = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": { "retry_count": 4 }
+        }))
+        .expect("policy");
+        assert!(partial.stream_continue_enabled);
+        assert_eq!(
+            partial.stream_continue_max,
+            DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX
+        );
+        assert!(partial.failover_enabled);
+    }
+
+    #[test]
+    fn stream_continue_and_failover_read_partial_account_overrides() {
+        let policy = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": {
+                "stream_continue_enabled": false,
+                "stream_continue_max": 3,
+                "failover_enabled": false,
+            }
+        }))
+        .expect("policy");
+        assert!(!policy.stream_continue_enabled);
+        assert_eq!(policy.stream_continue_max, 3);
+        assert!(!policy.failover_enabled);
+    }
+
+    /// 续写是真实计费请求，超出上限必须拒绝，不能默默放大。
+    #[test]
+    fn stream_continue_max_rejects_values_above_the_ceiling() {
+        let error = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": { "stream_continue_max": MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX + 1 }
+        }))
+        .expect_err("above ceiling");
+        assert!(error.contains("stream_continue_max"));
+
+        assert!(
+            RouteCredentialFailurePolicy::from_config_value(&json!({
+                "failure_policy": { "stream_continue_max": 0 }
+            }))
+            .is_ok(),
+            "0 must stay legal: it is how an account turns continuation off"
+        );
     }
 }
