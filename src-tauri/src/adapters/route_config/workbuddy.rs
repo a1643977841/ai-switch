@@ -229,12 +229,6 @@ impl WorkBuddyAdapter {
     }
 
     fn model_record(&self, model: &ClientModel, url: &str, api_key: &str) -> Value {
-        // Per-model reasoning tiers. WorkBuddy's `models.json` has no
-        // enable/disable boolean for reasoning — listing the tiers is what
-        // surfaces the control in the UI. `reasoning_levels` is never empty
-        // here: `resolve_client_models` fills a default ladder for any model
-        // the account left undeclared, so an unmatched relay model (e.g.
-        // stepfun) still offers low/medium/high instead of no control.
         let mut record = json!({
             "id": model.id,
             "name": format!("{} {}", self.display_name_prefix, model.id),
@@ -245,16 +239,30 @@ impl WorkBuddyAdapter {
             "maxOutputTokens": model.max_output_tokens,
             "supportsToolCall": true,
             "supportsImages": model.supports_image_input,
-            "reasoningEfforts": model.reasoning_levels,
             "aiSwitch": { "managed": true, "platform": self.platform.as_str() },
         });
-        // Preselect the deepest available tier. The list is ordered
-        // low → high, so the last entry is the model's top effort (e.g. `max`
-        // for a DeepSeek‑V4 relay). WorkBuddy reads this field to preselect the
-        // reasoning effort, so the model opens at its highest tier rather than
-        // the client's own quiet default.
-        if let Some(default) = model.reasoning_levels.last() {
-            record["defaultReasoningEffort"] = json!(default);
+        // WorkBuddy's `models.json` only surfaces the "思考能力" (reasoning) toggle
+        // when a model carries the top-level `supportsReasoning` boolean together
+        // with a `reasoning` object. The boolean is the actual on/off switch the
+        // settings UI reads, so without it the toggle stays greyed out even when
+        // tiers are listed. `reasoning_levels` is never empty here:
+        // `resolve_client_models` fills a default ladder for any model the account
+        // left undeclared, so an unmatched relay model (e.g. stepfun) still offers
+        // low/medium/high instead of no control.
+        if !model.reasoning_levels.is_empty() {
+            // Preselect the deepest available tier. The list is ordered
+            // low → high, so the last entry is the model's top effort (e.g. `max`
+            // for a DeepSeek‑V4 relay). WorkBuddy reads `reasoning.defaultEffort`
+            // to preselect the reasoning effort, so the model opens at its highest
+            // tier rather than the client's own quiet default. `canDisableThinking`
+            // lets the user turn reasoning off per chat.
+            let default = model.reasoning_levels.last().expect("non-empty ladder");
+            record["supportsReasoning"] = json!(true);
+            record["reasoning"] = json!({
+                "defaultEffort": default,
+                "supportedEfforts": model.reasoning_levels,
+                "canDisableThinking": true,
+            });
         }
         record
     }
@@ -517,18 +525,24 @@ mod tests {
             .iter()
             .find(|record| record["id"] == "deepseek-v4-flash")
             .expect("flash record");
+        // The "思考能力" toggle is enabled via the `supportsReasoning` boolean.
+        assert_eq!(flash["supportsReasoning"], true);
         assert_eq!(
-            flash["reasoningEfforts"],
+            flash["reasoning"]["supportedEfforts"],
             json!(["low", "medium", "high", "max"])
         );
         // Preselected to the deepest tier so the model opens on `max`.
-        assert_eq!(flash["defaultReasoningEffort"], "max");
+        assert_eq!(flash["reasoning"]["defaultEffort"], "max");
+        assert_eq!(flash["reasoning"]["canDisableThinking"], true);
 
         let sol = records
             .iter()
             .find(|record| record["id"] == "gpt-5.6-sol")
             .expect("sol record");
-        assert_eq!(sol["defaultReasoningEffort"], "ultra");
+        // `ultra` is a synthetic last tier here only to prove `defaultEffort`
+        // tracks the last (deepest) entry; real ladders use the WorkBuddy
+        // effort enum (off/minimal/low/medium/high/xhigh/max).
+        assert_eq!(sol["reasoning"]["defaultEffort"], "ultra");
     }
 
     #[test]
