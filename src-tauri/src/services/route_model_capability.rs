@@ -1719,9 +1719,8 @@ mod tests {
             Value::from(default_third_party_reasoning_levels("some-relay-model")),
             fixture["third_party_default_reasoning_levels"]
         );
-        let extra = default_third_party_reasoning_levels("deepseek-v4-flash")
-            .last()
-            .expect("a tier");
+        let ladder = default_third_party_reasoning_levels("deepseek-v4-flash");
+        let extra = ladder.last().expect("a tier");
         let expected_extra = fixture["third_party_deepseek_v4_extra_reasoning_level"]
             .as_str()
             .expect("extra tier");
