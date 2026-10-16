@@ -255,13 +255,14 @@ impl WorkBuddyAdapter {
             // for a DeepSeek‑V4 relay). WorkBuddy reads `reasoning.defaultEffort`
             // to preselect the reasoning effort, so the model opens at its highest
             // tier rather than the client's own quiet default. `canDisableThinking`
-            // lets the user turn reasoning off per chat.
+            // follows WorkBuddy's own default (`false`): once a model advertises
+            // reasoning, the "思考能力" toggle cannot be switched off.
             let default = model.reasoning_levels.last().expect("non-empty ladder");
             record["supportsReasoning"] = json!(true);
             record["reasoning"] = json!({
                 "defaultEffort": default,
                 "supportedEfforts": model.reasoning_levels,
-                "canDisableThinking": true,
+                "canDisableThinking": false,
             });
         }
         record
@@ -533,7 +534,8 @@ mod tests {
         );
         // Preselected to the deepest tier so the model opens on `max`.
         assert_eq!(flash["reasoning"]["defaultEffort"], "max");
-        assert_eq!(flash["reasoning"]["canDisableThinking"], true);
+        // WorkBuddy's own default: the reasoning toggle cannot be switched off.
+        assert_eq!(flash["reasoning"]["canDisableThinking"], false);
 
         let sol = records
             .iter()
