@@ -215,6 +215,7 @@ const CODEX_ONE_M_UPSTREAM_PREFIXES: &[&str] = &[
 ];
 const CODEX_BASELINE_CONTEXT_WINDOWS: &[(&str, u32)] = &[
     ("gpt-6-astra", 1_050_000),
+    ("gpt-6.1-sol", CODEX_ONE_M_CONTEXT_WINDOW),
     ("gpt-5.6-sol", 272_000),
     ("gpt-5.6-terra", 272_000),
     ("gpt-5.6-luna", 272_000),
@@ -1826,6 +1827,8 @@ mod tests {
             );
         }
         assert_eq!(codex_default_context_window("gpt-6-astra"), 1_050_000);
+        // 1M on the nose, unlike astra's slightly larger 1.05M window.
+        assert_eq!(codex_default_context_window("gpt-6.1-sol"), 1_000_000);
     }
 
     #[test]

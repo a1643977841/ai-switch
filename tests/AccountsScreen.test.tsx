@@ -3529,13 +3529,15 @@ describe("AccountsScreen", () => {
     expect(screen.queryByRole("status", { name: "Base URL 自动调整提示" })).not.toBeInTheDocument();
     expect(screen.getByLabelText("接口格式")).toHaveValue("openai-responses");
     expect(screen.getByLabelText("API 账号名称")).toHaveValue("AgentRouter");
-    expect(screen.getByLabelText("请求模型 1")).toHaveValue("gpt-6-astra");
-    expect(screen.getByLabelText("上游模型 1")).toHaveValue("gpt-6-astra");
-    expect(screen.getByLabelText("请求模型 2")).toHaveValue("glm-5.3");
-    expect(screen.getByLabelText("上游模型 2")).toHaveValue("glm-5.3");
-    expect(screen.getByLabelText("请求模型 3")).toHaveValue("deepseek-v4-flash");
-    expect(screen.getByLabelText("上游模型 3")).toHaveValue("deepseek-v4-flash");
-    expect(screen.queryByLabelText("请求模型 4")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("请求模型 1")).toHaveValue("gpt-6.1-sol");
+    expect(screen.getByLabelText("上游模型 1")).toHaveValue("gpt-6.1-sol");
+    expect(screen.getByLabelText("请求模型 2")).toHaveValue("gpt-6-astra");
+    expect(screen.getByLabelText("上游模型 2")).toHaveValue("gpt-6-astra");
+    expect(screen.getByLabelText("请求模型 3")).toHaveValue("claude-opus-5-5");
+    expect(screen.getByLabelText("上游模型 3")).toHaveValue("claude-opus-5-5");
+    expect(screen.getByLabelText("请求模型 4")).toHaveValue("deepseek-v4-flash");
+    expect(screen.getByLabelText("上游模型 4")).toHaveValue("deepseek-v4-flash");
+    expect(screen.queryByLabelText("请求模型 5")).not.toBeInTheDocument();
     expect(
       screen.getByText("已套用 AgentRouter 预设，通常只需填写 API Key。"),
     ).toBeInTheDocument();
@@ -3586,8 +3588,8 @@ describe("AccountsScreen", () => {
       "agentrouter-primary",
     );
 
-    expect(screen.getByLabelText("请求模型 1")).toHaveValue("gpt-6-astra");
-    expect(screen.getByLabelText("上游模型 1")).toHaveValue("gpt-6-astra");
+    expect(screen.getByLabelText("请求模型 1")).toHaveValue("gpt-6.1-sol");
+    expect(screen.getByLabelText("上游模型 1")).toHaveValue("gpt-6.1-sol");
     // The hand-typed row is gone rather than pushed below the preset rows.
     expect(screen.queryByDisplayValue("foo")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("请求模型 5")).not.toBeInTheDocument();
@@ -3635,7 +3637,7 @@ describe("AccountsScreen", () => {
           base_url: "https://agentrouter.org/v1",
           interface_format: "openai-responses",
           model_mappings_json:
-            "[{\"from\":\"gpt-6-astra\",\"to\":\"gpt-6-astra\"},{\"from\":\"glm-5.3\",\"to\":\"glm-5.3\"},{\"from\":\"deepseek-v4-flash\",\"to\":\"deepseek-v4-flash\"}]",
+            "[{\"from\":\"gpt-6.1-sol\",\"to\":\"gpt-6.1-sol\"},{\"from\":\"gpt-6-astra\",\"to\":\"gpt-6-astra\"},{\"from\":\"claude-opus-5-5\",\"to\":\"claude-opus-5-5\"},{\"from\":\"deepseek-v4-flash\",\"to\":\"deepseek-v4-flash\"}]",
         }),
       ),
     );
@@ -3741,7 +3743,7 @@ describe("AccountsScreen", () => {
     expect(screen.getByLabelText("API 账号名称")).toHaveValue("AgentRouter Claude");
     // All six role rows, including Subagent and the catch-all.
     for (const row of [1, 2, 3, 4, 5, 6]) {
-      expect(screen.getByLabelText(`上游模型 ${row}`)).toHaveValue("claude-opus-5");
+      expect(screen.getByLabelText(`上游模型 ${row}`)).toHaveValue("claude-opus-5-5");
     }
     // 1M stays for the user to tick: an upstream without the tier answers 503.
     expect(screen.getByLabelText("声明支持 1M 1")).not.toBeChecked();

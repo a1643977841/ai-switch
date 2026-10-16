@@ -49,7 +49,8 @@ use crate::services::route_model_capability::{
     CatalogMemberInput, ModelCapability, ModelMatchMode, CODEX_ONE_M_CONTEXT_WINDOW,
 };
 use crate::services::route_pool_model_mode::{
-    accepted_prefixes, is_official_model_prefix, split_prefixed_model, PoolModelMode,
+    accepted_prefixes, is_official_model_prefix, split_prefixed_model, strip_vendor_model_tag,
+    PoolModelMode,
 };
 use crate::services::route_protocol_bridge::{
     force_reasoning_content_on_chat_body, is_anthropic_count_tokens_path,
@@ -4971,6 +4972,20 @@ fn resolve_account_scoped_model(
 ) -> (Vec<PoolCandidate>, Option<String>, axum::body::Bytes) {
     let Some(model) = requested_model else {
         return (candidates, None, body);
+    };
+    // A client we handed a tagged id to sends `AISwitch:<catalog id>`. Peel the
+    // tag — and rewrite the body to match, so the upstream never sees it — before
+    // anything tries to interpret the name. Both modes fall out of this: precise
+    // mode leaves `<账号前缀>/<别名>` for the split below, aggregate mode leaves a
+    // bare alias that simply does not split.
+    let (model, body) = match strip_vendor_model_tag(&model) {
+        Some(rest) => {
+            let rest = rest.to_string();
+            let rewritten =
+                axum::body::Bytes::from(strip_model_prefix_in_body(&body, &model, &rest));
+            (rest, rewritten)
+        }
+        None => (model, body),
     };
     let Some((prefix, alias)) = split_prefixed_model(&model) else {
         return (candidates, Some(model), body);
@@ -17041,6 +17056,78 @@ data: [DONE]\n\n";
         // The body has to carry the bare alias: the API branch maps it per account
         // and the official branch forwards it untouched.
         assert_eq!(body["model"], "gpt-5.6-sol");
+    }
+
+    /// What WorkBuddy sends: its picker needs `id` and `name` to be one string, so
+    /// we tag the catalog id and peel the tag back off here.
+    #[test]
+    fn a_vendor_tagged_precise_model_is_peeled_before_the_account_split() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+        let kan = api_credential_with_config(
+            "247Kan",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"other-upstream"}]}"#,
+        );
+
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![grox, kan],
+            "AISwitch:Grox/gpt-5.6-sol",
+            r#"{"model":"AISwitch:Grox/gpt-5.6-sol"}"#,
+        );
+
+        assert_eq!(accounts, vec!["Grox".to_string()]);
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        // The tag must not reach the upstream either.
+        assert_eq!(body["model"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn a_vendor_tagged_aggregate_model_loses_only_the_tag() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+        let kan = api_credential_with_config(
+            "247Kan",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"other-upstream"}]}"#,
+        );
+
+        // Aggregate mode advertises `AISwitch:<model>`: no account segment to
+        // split, so nothing is pinned and only the tag comes off.
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![grox, kan],
+            "AISwitch:gpt-5.6-sol",
+            r#"{"model":"AISwitch:gpt-5.6-sol"}"#,
+        );
+
+        assert_eq!(accounts, vec!["Grox".to_string(), "247Kan".to_string()]);
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(body["model"], "gpt-5.6-sol");
+    }
+
+    /// Relays publish model names that already contain `:`. Only our own tag may
+    //  be peeled — a blind "everything after the first colon" would cut these.
+    #[test]
+    fn a_colon_inside_a_model_name_is_not_mistaken_for_the_vendor_tag() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"glm-5.3:cloud","to":"glm-upstream"}]}"#,
+        );
+
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![grox],
+            "glm-5.3:cloud",
+            r#"{"model":"glm-5.3:cloud"}"#,
+        );
+
+        assert_eq!(model.as_deref(), Some("glm-5.3:cloud"));
+        assert_eq!(body["model"], "glm-5.3:cloud");
+        assert_eq!(accounts, vec!["Grox".to_string()]);
     }
 
     #[test]

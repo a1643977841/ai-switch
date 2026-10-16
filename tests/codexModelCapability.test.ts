@@ -146,6 +146,7 @@ describe("codexModelCapability", () => {
 
   it("gives each GPT baseline model its shipped context window", () => {
     expect(codexDefaultContextWindow("gpt-6-astra")).toBe(1_050_000);
+    expect(codexDefaultContextWindow("gpt-6.1-sol")).toBe(1_000_000);
     for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]) {
       expect(codexDefaultContextWindow(model)).toBe(272_000);
     }

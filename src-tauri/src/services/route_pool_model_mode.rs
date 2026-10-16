@@ -138,6 +138,35 @@ pub(crate) fn is_official_model_prefix(prefix: &str) -> bool {
     prefix.trim().eq_ignore_ascii_case(OFFICIAL_MODEL_PREFIX)
 }
 
+/// Vendor tag we put on the model ids handed to clients whose picker would
+/// otherwise show a duplicated row.
+///
+/// WorkBuddy keys its model picker on `id` but displays `name`, and renders a
+/// row per distinct value — so decorating the display name made every entry long
+/// and listed it twice. Both fields now carry the same tagged id, which keeps
+/// the picker to one row per model, and [`strip_vendor_model_tag`] peels the tag
+/// back off at the route: `AISwitch:<model>` in aggregate mode,
+/// `AISwitch:<account>/<model>` in precise mode.
+pub(crate) const VENDOR_MODEL_TAG: &str = "AISwitch";
+
+/// Peel our `AISwitch:` vendor tag off a client-sent model name, returning the
+/// bare catalog id.
+///
+/// Only our own tag is stripped. Model names legitimately contain `:` — relays
+/// publish `vendor:tag` shaped names of their own — so blindly taking everything
+/// after the first colon would cut those in half.
+pub(crate) fn strip_vendor_model_tag(model: &str) -> Option<&str> {
+    let (tag, rest) = model.trim().split_once(':')?;
+    if !tag.trim().eq_ignore_ascii_case(VENDOR_MODEL_TAG) {
+        return None;
+    }
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest)
+}
+
 fn sanitize_prefix(display_name: &str) -> String {
     let mut out = String::new();
     for character in display_name.trim().chars() {
@@ -292,5 +321,26 @@ mod tests {
         assert!(is_official_model_prefix("official"));
         assert!(is_official_model_prefix(" OFFICIAL "));
         assert!(!is_official_model_prefix("official-abcdef"));
+    }
+
+    /// Only our own tag is peeled. Aggregate mode sends `AISwitch:<model>` and
+    /// precise mode `AISwitch:<account>/<model>`; both must come back as the bare
+    /// catalog id so the existing account split still applies.
+    #[test]
+    fn the_vendor_tag_is_peeled_and_nothing_else_is() {
+        assert_eq!(strip_vendor_model_tag("AISwitch:gpt-5.6-sol"), Some("gpt-5.6-sol"));
+        assert_eq!(
+            strip_vendor_model_tag("AISwitch:Grox/gpt-5.6-sol"),
+            Some("Grox/gpt-5.6-sol")
+        );
+        // Case-insensitive, like every other prefix comparison here.
+        assert_eq!(strip_vendor_model_tag("aiswitch:gpt-5.6-sol"), Some("gpt-5.6-sol"));
+        assert_eq!(strip_vendor_model_tag(" AISwitch : gpt-5.6-sol "), Some("gpt-5.6-sol"));
+
+        // A colon that is part of a relay's own model name is not our tag.
+        assert_eq!(strip_vendor_model_tag("glm-5.3:cloud"), None);
+        assert_eq!(strip_vendor_model_tag("gpt-5.6-sol"), None);
+        assert_eq!(strip_vendor_model_tag("AISwitch:"), None);
+        assert_eq!(strip_vendor_model_tag("AISwitch"), None);
     }
 }

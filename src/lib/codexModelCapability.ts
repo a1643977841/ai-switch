@@ -200,6 +200,7 @@ export const CODEX_ONE_M_UPSTREAM_PREFIXES = [
  * still declare a different number, and the pool merge keeps the maximum. */
 const CODEX_BASELINE_CONTEXT_WINDOWS: Record<string, number> = {
   "gpt-6-astra": 1_050_000,
+  "gpt-6.1-sol": CODEX_ONE_M_CONTEXT_WINDOW,
   "gpt-5.6-sol": 272_000,
   "gpt-5.6-terra": 272_000,
   "gpt-5.6-luna": 272_000,

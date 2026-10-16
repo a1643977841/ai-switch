@@ -29,8 +29,9 @@ export type AccountPreset = {
  * are not supported" as soon as the client sends tools.
  */
 const AGENTROUTER_CODEX_MODELS = [
+  "gpt-6.1-sol",
   "gpt-6-astra",
-  "glm-5.3",
+  "claude-opus-5-5",
   "deepseek-v4-flash",
 ] as const;
 
@@ -92,7 +93,7 @@ export const ACCOUNT_PRESETS: AccountPreset[] = [
     defaultName: "AgentRouter Claude",
     baseUrl: "https://ps.air-outer.com",
     interfaceFormat: "anthropic",
-    modelMappings: claudeRolesMappedTo("claude-opus-5"),
+    modelMappings: claudeRolesMappedTo("claude-opus-5-5"),
   },
   {
     id: "gorouter-claude",

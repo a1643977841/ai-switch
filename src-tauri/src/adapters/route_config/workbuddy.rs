@@ -2,7 +2,11 @@ use super::{
     client_home, existing_text, generated_invalid, invalid_existing_config, ClientModel,
     RouteConfigInput, TargetAdapter, TargetInspection,
 };
-use crate::{error::AppError, models::platform::PlatformId};
+use crate::{
+    error::AppError,
+    models::platform::PlatformId,
+    services::route_pool_model_mode::VENDOR_MODEL_TAG,
+};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -50,7 +54,6 @@ pub(super) struct WorkBuddyAdapter {
     /// Home-relative data dir holding `models.json`.
     config_dir: &'static str,
     platform: PlatformId,
-    display_name_prefix: &'static str,
 }
 
 impl WorkBuddyAdapter {
@@ -61,7 +64,6 @@ impl WorkBuddyAdapter {
             client_display_name: "WorkBuddy",
             config_dir: ".workbuddy",
             platform: PlatformId::Codex,
-            display_name_prefix: "AI Switch",
         }
     }
 
@@ -72,7 +74,6 @@ impl WorkBuddyAdapter {
             client_display_name: "WorkBuddy",
             config_dir: ".workbuddy",
             platform: PlatformId::Claude,
-            display_name_prefix: "AI Switch Claude",
         }
     }
 
@@ -86,7 +87,6 @@ impl WorkBuddyAdapter {
             client_display_name: "WorkBuddy AI",
             config_dir: ".workbuddy-ai",
             platform: PlatformId::Codex,
-            display_name_prefix: "AI Switch",
         }
     }
 
@@ -97,7 +97,6 @@ impl WorkBuddyAdapter {
             client_display_name: "WorkBuddy AI",
             config_dir: ".workbuddy-ai",
             platform: PlatformId::Claude,
-            display_name_prefix: "AI Switch Claude",
         }
     }
 
@@ -108,7 +107,6 @@ impl WorkBuddyAdapter {
             client_display_name: "CodeBuddy CLI",
             config_dir: ".codebuddy",
             platform: PlatformId::Codex,
-            display_name_prefix: "AI Switch",
         }
     }
 
@@ -119,7 +117,6 @@ impl WorkBuddyAdapter {
             client_display_name: "CodeBuddy CLI",
             config_dir: ".codebuddy",
             platform: PlatformId::Claude,
-            display_name_prefix: "AI Switch Claude",
         }
     }
 
@@ -229,9 +226,17 @@ impl WorkBuddyAdapter {
     }
 
     fn model_record(&self, model: &ClientModel, url: &str, api_key: &str) -> Value {
+        // WorkBuddy keys its picker on `id` but displays `name`, and lists a row
+        // per distinct value — so decorating the display name made every entry
+        // long and showed it twice. Both fields carry the same tagged id now:
+        // the tag marks the entry as ours (and keeps it distinct from a
+        // same-named model the user added by hand), and the route peels it off
+        // before resolving the catalog id. Aggregate mode yields
+        // `AISwitch:<model>`, precise mode `AISwitch:<account>/<model>`.
+        let id = format!("{}:{}", VENDOR_MODEL_TAG, model.id);
         let mut record = json!({
-            "id": model.id,
-            "name": format!("{} {}", self.display_name_prefix, model.id),
+            "id": id,
+            "name": id.clone(),
             "vendor": "Custom",
             "url": url,
             "apiKey": api_key,
@@ -524,7 +529,7 @@ mod tests {
 
         let flash = records
             .iter()
-            .find(|record| record["id"] == "deepseek-v4-flash")
+            .find(|record| record["id"] == "AISwitch:deepseek-v4-flash")
             .expect("flash record");
         // The "思考能力" toggle is enabled via the `supportsReasoning` boolean.
         assert_eq!(flash["supportsReasoning"], true);
@@ -539,7 +544,7 @@ mod tests {
 
         let sol = records
             .iter()
-            .find(|record| record["id"] == "gpt-5.6-sol")
+            .find(|record| record["id"] == "AISwitch:gpt-5.6-sol")
             .expect("sol record");
         // `ultra` is a synthetic last tier here only to prove `defaultEffort`
         // tracks the last (deepest) entry; real ladders use the WorkBuddy
@@ -675,7 +680,10 @@ mod tests {
         let json = render(codex_adapter().as_ref(), None, &["gpt-5.6-sol"]);
         let record = &json["models"][0];
 
-        assert_eq!(record["id"], "gpt-5.6-sol");
+        assert_eq!(record["id"], "AISwitch:gpt-5.6-sol");
+        // `name` has to equal `id`: WorkBuddy lists a row per distinct value, so
+        // a decorated display name came out as a long, duplicated row.
+        assert_eq!(record["name"], record["id"]);
         assert_eq!(record["apiKey"], CODEX_KEY);
         assert_eq!(record["vendor"], "Custom");
         assert_eq!(record["maxInputTokens"], 200_000);
@@ -687,6 +695,24 @@ mod tests {
         // override mode), so authoring them would be misleading.
         assert!(record.get("tags").is_none());
         assert!(record.get("aliases").is_none());
+    }
+
+    /// WorkBuddy renders one picker row per distinct value, so `id` and `name`
+    /// have to be the same string. Both modes put our tag on that one string.
+    #[test]
+    fn the_tagged_id_is_written_to_both_id_and_name_in_either_mode() {
+        let json = render(codex_adapter().as_ref(), None, &["gpt-5.6-sol"]);
+        let aggregate = &json["models"][0];
+        // Aggregate mode: `AISwitch:<model>`.
+        assert_eq!(aggregate["id"], "AISwitch:gpt-5.6-sol");
+        assert_eq!(aggregate["name"], "AISwitch:gpt-5.6-sol");
+
+        // Precise mode: the catalog id already carries the account segment, so
+        // the tag simply goes in front of it.
+        let json = render(codex_adapter().as_ref(), None, &["Grox/gpt-5.6-sol"]);
+        let precise = &json["models"][0];
+        assert_eq!(precise["id"], "AISwitch:Grox/gpt-5.6-sol");
+        assert_eq!(precise["name"], "AISwitch:Grox/gpt-5.6-sol");
     }
 
     #[test]
@@ -713,7 +739,7 @@ mod tests {
 
         assert_eq!(
             ids(&json),
-            vec!["my-own-model", "claude-sonnet-alias", "gpt-5.6-sol"]
+            vec!["my-own-model", "claude-sonnet-alias", "AISwitch:gpt-5.6-sol"]
         );
         // We never author availableModels, so a user who curated it keeps it.
         assert_eq!(json["availableModels"], json!(["my-own-model"]));
@@ -729,10 +755,13 @@ mod tests {
             )
             .expect("first render");
         let json: Value = serde_json::from_slice(&first).expect("valid JSON");
-        assert_eq!(ids(&json), vec!["gpt-5.6-sol", "gpt-5.6-sol-lite"]);
+        assert_eq!(
+            ids(&json),
+            vec!["AISwitch:gpt-5.6-sol", "AISwitch:gpt-5.6-sol-lite"]
+        );
 
         let narrowed = render(codex_adapter().as_ref(), Some(&first), &["gpt-5.6-sol"]);
-        assert_eq!(ids(&narrowed), vec!["gpt-5.6-sol"]);
+        assert_eq!(ids(&narrowed), vec!["AISwitch:gpt-5.6-sol"]);
     }
 
     #[test]
@@ -757,7 +786,7 @@ mod tests {
             .expect("render");
         let json: Value = serde_json::from_slice(&bytes).expect("valid JSON");
 
-        assert_eq!(ids(&json), vec!["gpt-5.6-sol"]);
+        assert_eq!(ids(&json), vec!["AISwitch:gpt-5.6-sol"]);
         assert_eq!(json["models"][0]["apiKey"], CODEX_KEY);
         assert_eq!(json["models"][0]["aiSwitch"]["managed"], true);
     }
@@ -767,7 +796,7 @@ mod tests {
         let existing = br#"[{ "id": "keep-me", "url": "https://upstream.example/v1" }]"#;
         let json = render(codex_adapter().as_ref(), Some(existing), &["gpt-5.6-sol"]);
 
-        assert_eq!(ids(&json), vec!["keep-me", "gpt-5.6-sol"]);
+        assert_eq!(ids(&json), vec!["keep-me", "AISwitch:gpt-5.6-sol"]);
     }
 
     #[test]
@@ -846,6 +875,6 @@ mod tests {
     #[test]
     fn empty_file_renders_a_fresh_model_list() {
         let json = render(codex_adapter().as_ref(), Some(b"   "), &["gpt-5.6-sol"]);
-        assert_eq!(ids(&json), vec!["gpt-5.6-sol"]);
+        assert_eq!(ids(&json), vec!["AISwitch:gpt-5.6-sol"]);
     }
 }

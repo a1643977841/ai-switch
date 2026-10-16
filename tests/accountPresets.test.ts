@@ -32,8 +32,9 @@ describe("accountPresets", () => {
     expect(preset.baseUrl).toBe("https://agentrouter.org/v1");
     expect(preset.interfaceFormat).toBe("openai-responses");
     expect(preset.modelMappings).toEqual([
+      { from: "gpt-6.1-sol", to: "gpt-6.1-sol" },
       { from: "gpt-6-astra", to: "gpt-6-astra" },
-      { from: "glm-5.3", to: "glm-5.3" },
+      { from: "claude-opus-5-5", to: "claude-opus-5-5" },
       { from: "deepseek-v4-flash", to: "deepseek-v4-flash" },
     ]);
   });
@@ -46,8 +47,9 @@ describe("accountPresets", () => {
     expect(preset.baseUrl).toBe("https://ps.air-outer.com/v1");
     expect(preset.interfaceFormat).toBe("openai-responses");
     expect(preset.modelMappings).toEqual([
+      { from: "gpt-6.1-sol", to: "gpt-6.1-sol" },
       { from: "gpt-6-astra", to: "gpt-6-astra" },
-      { from: "glm-5.3", to: "glm-5.3" },
+      { from: "claude-opus-5-5", to: "claude-opus-5-5" },
       { from: "deepseek-v4-flash", to: "deepseek-v4-flash" },
     ]);
   });
@@ -88,12 +90,12 @@ describe("accountPresets", () => {
     expect(preset.baseUrl).toBe("https://ps.air-outer.com");
     expect(preset.interfaceFormat).toBe("anthropic");
     expect(preset.modelMappings).toEqual([
-      { from: "claude-sonnet-alias", to: "claude-opus-5" },
-      { from: "claude-opus-alias", to: "claude-opus-5" },
-      { from: "claude-fable-alias", to: "claude-opus-5" },
-      { from: "claude-haiku-alias", to: "claude-opus-5" },
-      { from: "claude-subagent", to: "claude-opus-5" },
-      { from: "claude-model", to: "claude-opus-5" },
+      { from: "claude-sonnet-alias", to: "claude-opus-5-5" },
+      { from: "claude-opus-alias", to: "claude-opus-5-5" },
+      { from: "claude-fable-alias", to: "claude-opus-5-5" },
+      { from: "claude-haiku-alias", to: "claude-opus-5-5" },
+      { from: "claude-subagent", to: "claude-opus-5-5" },
+      { from: "claude-model", to: "claude-opus-5-5" },
     ]);
   });
 
