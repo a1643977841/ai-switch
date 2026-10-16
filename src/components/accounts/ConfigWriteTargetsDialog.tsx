@@ -326,7 +326,12 @@ export function ConfigWriteTargetsDialog({
   );
   const restartNames = restartClients.map((client) => client.display_name).join("、");
   const deepSeekHarnessClient = clients.find(
-    (client) => client.client_key === "deepseek_harness",
+    (client) =>
+      client.client_key === "deepseek_harness" ||
+      client.client_key === "deepseek_harness_desktop",
+  );
+  const deepSeekHarnessDesktopSelected = selected.includes(
+    "deepseek_harness_desktop",
   );
   const deepSeekHarnessPath =
     deepSeekHarnessPathOverride ?? deepSeekHarnessConfigPath ?? "";
@@ -571,7 +576,9 @@ export function ConfigWriteTargetsDialog({
                   </p>
                 ) : null}
 
-                {deepSeekHarnessClient && selected.includes("deepseek_harness") ? (
+                {deepSeekHarnessClient &&
+                (selected.includes("deepseek_harness") ||
+                  deepSeekHarnessDesktopSelected) ? (
                   <label className="grid gap-1.5 rounded-md bg-stone-50 px-3.5 py-3 text-xs text-stone-700">
                     <span className="text-[11px] font-semibold text-stone-600">
                       DSH 配置文件路径
@@ -581,7 +588,11 @@ export function ConfigWriteTargetsDialog({
                       className="h-8 rounded-md border border-stone-200 bg-white px-2.5 font-mono text-[11px] text-stone-800 outline-none placeholder:font-sans placeholder:text-stone-400 focus:border-blue-400"
                       disabled={disabled || loading}
                       onChange={(event) => setDeepSeekHarnessPathOverride(event.target.value)}
-                      placeholder="留空使用 ~/.dsh/settings.yaml"
+                      placeholder={
+                        deepSeekHarnessDesktopSelected
+                          ? "留空使用 ~/.dsh/profiles/desktop/cordis.patch.yml"
+                          : "留空使用 ~/.dsh/settings.yaml"
+                      }
                       type="text"
                       value={deepSeekHarnessPath}
                     />

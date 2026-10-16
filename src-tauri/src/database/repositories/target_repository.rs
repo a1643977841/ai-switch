@@ -25,6 +25,16 @@ impl TargetRepository {
                 "claude",
                 "DeepSeek Harness (Claude)",
             ),
+            (
+                "deepseek_harness_desktop_codex",
+                "codex",
+                "DeepSeek Harness Desktop (Codex)",
+            ),
+            (
+                "deepseek_harness_desktop_claude",
+                "claude",
+                "DeepSeek Harness Desktop (Claude)",
+            ),
             ("workbuddy_codex", "codex", "WorkBuddy (Codex)"),
             ("workbuddy_claude", "claude", "WorkBuddy (Claude)"),
             // The overseas build ships `dataFolderName: ".workbuddy-ai"`, so it

@@ -11,6 +11,19 @@ pub(super) struct DeepSeekHarnessAdapter {
     /// Provider ID used in the yaml file
     provider_id: &'static str,
     display_name: &'static str,
+    /// Which profile this variant writes, if any.
+    ///
+    /// `None` keeps the legacy `~/.dsh/settings.yaml` document that dsh read up
+    /// to 0.1.6. `Some(profile)` writes that profile's patch document,
+    /// `~/.dsh/profiles/<profile>/cordis.patch.yml`: from 0.1.7 on dsh stopped
+    /// treating `settings.yaml` as a live source — it is imported once and
+    /// renamed to `settings.yaml.imported` — and persists providers as a patch
+    /// entry on the running profile instead.
+    ///
+    /// The official desktop app is a second install with its own `desktop`
+    /// profile (the CLI runs `web`), so it needs its own target rather than
+    /// just a different path: the two profiles hold different documents.
+    profile: Option<&'static str>,
 }
 
 impl DeepSeekHarnessAdapter {
@@ -19,6 +32,7 @@ impl DeepSeekHarnessAdapter {
             platform: PlatformId::Codex,
             provider_id: "ai-switch-codex",
             display_name: "AI Switch (Codex)",
+            profile: None,
         }
     }
 
@@ -27,6 +41,29 @@ impl DeepSeekHarnessAdapter {
             platform: PlatformId::Claude,
             provider_id: "ai-switch-claude",
             display_name: "AI Switch (Claude)",
+            profile: None,
+        }
+    }
+
+    /// The official desktop app (`apps/desktop` in
+    /// deepseek-ai/deepseek-harness) runs its own `desktop` profile, so its
+    /// providers live in a different document from the `web` profile the CLI
+    /// uses — even though both share `~/.dsh`.
+    pub(super) const fn desktop_codex() -> Self {
+        Self {
+            platform: PlatformId::Codex,
+            provider_id: "ai-switch-codex",
+            display_name: "AI Switch (Codex)",
+            profile: Some("desktop"),
+        }
+    }
+
+    pub(super) const fn desktop_claude() -> Self {
+        Self {
+            platform: PlatformId::Claude,
+            provider_id: "ai-switch-claude",
+            display_name: "AI Switch (Claude)",
+            profile: Some("desktop"),
         }
     }
 
@@ -143,53 +180,121 @@ impl DeepSeekHarnessAdapter {
             })
             .collect()
     }
-}
 
-impl TargetAdapter for DeepSeekHarnessAdapter {
-    fn target_key(&self) -> &'static str {
-        match self.platform {
-            PlatformId::Codex => "deepseek_harness_codex",
-            PlatformId::Claude => "deepseek_harness_claude",
-            _ => unreachable!(),
-        }
+    /// Build the provider record we own, preserving any user-edited
+    /// `displayName`.
+    ///
+    /// Shared by both config stores: the record shape is identical whether it
+    /// hangs off `llm-pi-ai.providers` in `settings.yaml` or off the
+    /// `llm-pi-ai` patch entry's `config.providers` in a profile document.
+    fn provider_record(&self, existing: Option<&Mapping>, input: &RouteConfigInput) -> Mapping {
+        let mut record = existing.cloned().unwrap_or_else(Mapping::new);
+
+        // Keep user-edited displayName if present
+        let display_name = record
+            .get(&Value::String("displayName".to_string()))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(self.display_name)
+            .to_string();
+
+        record.insert(
+            Value::String("displayName".to_string()),
+            Value::String(display_name),
+        );
+        // The route authenticates with an `Authorization` header rather than
+        // `apiKeyEnv`.
+        //
+        // `apiKeyEnv` is not a literal key: it is a *credential reference*, an
+        // env-var-shaped name the harness resolves per request across its `env`,
+        // `file` (`~/.dsh/.credentials.yaml` `refs:`), `project-env` and
+        // `user-env` layers. Writing `apiKeyEnv: AI_SWITCH_API_KEY` while nothing
+        // supplies that name leaves a dangling reference, and a named-but-
+        // unresolvable reference fails the request with `MISSING_CREDENTIAL`
+        // before any header is tried — so the old entry could never authenticate.
+        //
+        // A route naming no credential is deliberately unauthenticated and hands
+        // the requirement to the protocol, and pi-ai's OpenAI-compatible
+        // implementation accepts an `Authorization` header of its own. Profile
+        // headers reach the request with only `user-agent` reserved for the
+        // harness's own attribution, so this is the one mechanism that needs
+        // neither an exported variable nor a write into the harness credential
+        // store.
+        record.remove(&Value::String("apiKeyEnv".to_string()));
+        let mut headers = record
+            .get(&Value::String("headers".to_string()))
+            .and_then(Value::as_mapping)
+            .cloned()
+            .unwrap_or_else(Mapping::new);
+        headers.insert(
+            Value::String("Authorization".to_string()),
+            Value::String(format!("Bearer {}", input.route_proxy_key)),
+        );
+        record.insert(
+            Value::String("headers".to_string()),
+            Value::Mapping(headers),
+        );
+        record.insert(
+            Value::String("api".to_string()),
+            Value::String("openai-completions".to_string()),
+        );
+        record.insert(
+            Value::String("baseURL".to_string()),
+            Value::String(self.base_url(&input.base_url)),
+        );
+
+        // Add models
+        let model_list = Value::Sequence(self.model_entries(&input.client_models));
+        record.insert(Value::String("models".to_string()), model_list);
+
+        // Add managed marker
+        let mut ai_switch = Mapping::new();
+        ai_switch.insert(Value::String("managed".to_string()), Value::Bool(true));
+        ai_switch.insert(
+            Value::String("platform".to_string()),
+            Value::String(self.platform.as_str().to_string()),
+        );
+        record.insert(
+            Value::String("aiSwitch".to_string()),
+            Value::Mapping(ai_switch),
+        );
+        record
     }
 
-    fn client_key(&self) -> &'static str {
-        "deepseek_harness"
+    /// Pick the provider id to write — adopting an existing entry already aimed
+    /// at this proxy — and build the record to store under it.
+    fn provider_for(&self, providers: &Mapping, input: &RouteConfigInput) -> (String, Mapping) {
+        let provider_id = self
+            .adoption_target(providers, input)
+            .unwrap_or_else(|| self.provider_id.to_string());
+        let existing = providers
+            .get(&Value::String(provider_id.clone()))
+            .and_then(Value::as_mapping)
+            .cloned();
+        let record = self.provider_record(existing.as_ref(), input);
+        (provider_id, record)
     }
 
-    fn client_display_name(&self) -> &'static str {
-        "DeepSeek Harness"
+    /// Whether an already-resolved `providers` mapping carries our managed
+    /// marker for this adapter's platform.
+    fn holds_managed_platform(&self, providers: &Mapping) -> bool {
+        providers.values().any(|entry| {
+            entry
+                .get("aiSwitch")
+                .and_then(|marker| marker.get("managed"))
+                .and_then(Value::as_bool)
+                == Some(true)
+                && entry
+                    .get("aiSwitch")
+                    .and_then(|marker| marker.get("platform"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == self.platform.as_str())
+        })
     }
 
-    fn native(&self) -> bool {
-        false
-    }
-
-    fn restart_required(&self) -> bool {
-        true
-    }
-
-    fn requires_client_models(&self) -> bool {
-        true
-    }
-
-    fn platform(&self) -> PlatformId {
-        self.platform
-    }
-
-    fn resolve_path(&self, home: &Path) -> PathBuf {
-        home.join(".dsh").join("settings.yaml")
-    }
-
-    fn resolve_path_with_context(&self, home: &Path, paths: &RouteConfigPathContext) -> PathBuf {
-        paths
-            .deepseek_harness_config_path
-            .clone()
-            .unwrap_or_else(|| self.resolve_path(home))
-    }
-
-    fn render(
+    /// The legacy `~/.dsh/settings.yaml` document: a mapping whose
+    /// `llm-pi-ai.providers` holds one entry per provider.
+    fn render_settings(
         &self,
         path: &Path,
         existing: Option<&[u8]>,
@@ -238,87 +343,7 @@ impl TargetAdapter for DeepSeekHarnessAdapter {
                 invalid_existing_config(path, "YAML", "llm-pi-ai.providers must be a mapping")
             })?;
 
-        let provider_id = self
-            .adoption_target(providers, input)
-            .unwrap_or_else(|| self.provider_id.to_string());
-
-        // Keep existing entry if present to preserve custom fields
-        let existing_entry = providers.get(&Value::String(provider_id.clone())).cloned();
-
-        // Create or update the provider entry
-        let mut provider_entry = existing_entry
-            .and_then(|v| v.as_mapping().cloned())
-            .unwrap_or_else(Mapping::new);
-
-        // Keep user-edited displayName if present
-        let display_name = provider_entry
-            .get(&Value::String("displayName".to_string()))
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty())
-            .unwrap_or(self.display_name)
-            .to_string();
-
-        provider_entry.insert(
-            Value::String("displayName".to_string()),
-            Value::String(display_name),
-        );
-        // The route authenticates with an `Authorization` header rather than
-        // `apiKeyEnv`.
-        //
-        // `apiKeyEnv` is not a literal key: it is a *credential reference*, an
-        // env-var-shaped name the harness resolves per request across its `env`,
-        // `file` (`~/.dsh/.credentials.yaml` `refs:`), `project-env` and
-        // `user-env` layers. Writing `apiKeyEnv: AI_SWITCH_API_KEY` while nothing
-        // supplies that name leaves a dangling reference, and a named-but-
-        // unresolvable reference fails the request with `MISSING_CREDENTIAL`
-        // before any header is tried — so the old entry could never authenticate.
-        //
-        // A route naming no credential is deliberately unauthenticated and hands
-        // the requirement to the protocol, and pi-ai's OpenAI-compatible
-        // implementation accepts an `Authorization` header of its own. Profile
-        // headers reach the request with only `user-agent` reserved for the
-        // harness's own attribution, so this is the one mechanism that needs
-        // neither an exported variable nor a write into the harness credential
-        // store.
-        provider_entry.remove(&Value::String("apiKeyEnv".to_string()));
-        let mut headers = provider_entry
-            .get(&Value::String("headers".to_string()))
-            .and_then(Value::as_mapping)
-            .cloned()
-            .unwrap_or_else(Mapping::new);
-        headers.insert(
-            Value::String("Authorization".to_string()),
-            Value::String(format!("Bearer {}", input.route_proxy_key)),
-        );
-        provider_entry.insert(
-            Value::String("headers".to_string()),
-            Value::Mapping(headers),
-        );
-        provider_entry.insert(
-            Value::String("api".to_string()),
-            Value::String("openai-completions".to_string()),
-        );
-        provider_entry.insert(
-            Value::String("baseURL".to_string()),
-            Value::String(self.base_url(&input.base_url)),
-        );
-
-        // Add models
-        let model_list = Value::Sequence(self.model_entries(&input.client_models));
-        provider_entry.insert(Value::String("models".to_string()), model_list);
-
-        // Add managed marker
-        let mut ai_switch = Mapping::new();
-        ai_switch.insert(Value::String("managed".to_string()), Value::Bool(true));
-        ai_switch.insert(
-            Value::String("platform".to_string()),
-            Value::String(self.platform.as_str().to_string()),
-        );
-        provider_entry.insert(
-            Value::String("aiSwitch".to_string()),
-            Value::Mapping(ai_switch),
-        );
-
+        let (provider_id, provider_entry) = self.provider_for(providers, input);
         providers.insert(Value::String(provider_id), Value::Mapping(provider_entry));
 
         let rendered =
@@ -326,6 +351,191 @@ impl TargetAdapter for DeepSeekHarnessAdapter {
         let _validated: Value =
             serde_yaml::from_str(&rendered).map_err(|_| generated_invalid(path, "YAML"))?;
         Ok(rendered.into_bytes())
+    }
+
+    /// A profile patch document: a YAML *sequence* of cordis patch entries,
+    /// where model providers hang off the `llm-pi-ai` entry's `config.providers`.
+    ///
+    /// The patch layer replaces the whole `config` of the row it targets, so a
+    /// second `- id: llm-pi-ai` row would silently discard one of the two
+    /// providers — and a save from the harness UI would drop one as well. Every
+    /// write therefore merges into the single existing row rather than appending
+    /// a sibling.
+    fn render_profile_patch(
+        &self,
+        path: &Path,
+        existing: Option<&[u8]>,
+        input: &RouteConfigInput,
+    ) -> Result<Vec<u8>, AppError> {
+        let mut entries = match existing {
+            Some(bytes) => {
+                let content = existing_text(path, "YAML", bytes)?;
+                if content.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    let parsed: Value = serde_yaml::from_str(content)
+                        .map_err(|_| invalid_existing_config(path, "YAML", "syntax is invalid"))?;
+                    parsed.as_sequence().cloned().ok_or_else(|| {
+                        invalid_existing_config(
+                            path,
+                            "YAML",
+                            "root value must be a sequence of cordis patch entries",
+                        )
+                    })?
+                }
+            }
+            None => Vec::new(),
+        };
+
+        // A patch document may hold only one row per id.
+        let index = entries
+            .iter()
+            .position(|entry| entry.get("id").and_then(Value::as_str) == Some("llm-pi-ai"));
+
+        let mut entry = match index {
+            Some(index) => entries.remove(index),
+            None => {
+                let mut created = Mapping::new();
+                created.insert(
+                    Value::String("id".to_string()),
+                    Value::String("llm-pi-ai".to_string()),
+                );
+                created.insert(
+                    Value::String("name".to_string()),
+                    Value::String("@deepseek-ai/dsh-llm-pi-ai".to_string()),
+                );
+                Value::Mapping(created)
+            }
+        };
+
+        {
+            let entry_map = entry.as_mapping_mut().ok_or_else(|| {
+                invalid_existing_config(path, "YAML", "llm-pi-ai entry must be a mapping")
+            })?;
+            if !entry_map.contains_key(&Value::String("config".to_string())) {
+                entry_map.insert(
+                    Value::String("config".to_string()),
+                    Value::Mapping(Mapping::new()),
+                );
+            }
+            let config = entry_map
+                .get_mut(&Value::String("config".to_string()))
+                .and_then(Value::as_mapping_mut)
+                .ok_or_else(|| {
+                    invalid_existing_config(path, "YAML", "llm-pi-ai.config must be a mapping")
+                })?;
+            if !config.contains_key(&Value::String("providers".to_string())) {
+                config.insert(
+                    Value::String("providers".to_string()),
+                    Value::Mapping(Mapping::new()),
+                );
+            }
+            let providers = config
+                .get_mut(&Value::String("providers".to_string()))
+                .and_then(Value::as_mapping_mut)
+                .ok_or_else(|| {
+                    invalid_existing_config(
+                        path,
+                        "YAML",
+                        "llm-pi-ai.config.providers must be a mapping",
+                    )
+                })?;
+
+            let (provider_id, provider_entry) = self.provider_for(providers, input);
+            providers.insert(Value::String(provider_id), Value::Mapping(provider_entry));
+        }
+
+        // Put the row back where it was rather than at the end, so a write does
+        // not reshuffle entries the user ordered by hand.
+        match index {
+            Some(index) => entries.insert(index, entry),
+            None => entries.push(entry),
+        }
+
+        let rendered =
+            serde_yaml::to_string(&entries).map_err(|_| generated_invalid(path, "YAML"))?;
+        let _validated: Value =
+            serde_yaml::from_str(&rendered).map_err(|_| generated_invalid(path, "YAML"))?;
+        Ok(rendered.into_bytes())
+    }
+}
+
+impl TargetAdapter for DeepSeekHarnessAdapter {
+    fn target_key(&self) -> &'static str {
+        match (self.profile, self.platform) {
+            (Some(_), PlatformId::Codex) => "deepseek_harness_desktop_codex",
+            (Some(_), PlatformId::Claude) => "deepseek_harness_desktop_claude",
+            (None, PlatformId::Codex) => "deepseek_harness_codex",
+            (None, PlatformId::Claude) => "deepseek_harness_claude",
+            _ => unreachable!(),
+        }
+    }
+
+    fn client_key(&self) -> &'static str {
+        if self.profile.is_some() {
+            "deepseek_harness_desktop"
+        } else {
+            "deepseek_harness"
+        }
+    }
+
+    fn client_display_name(&self) -> &'static str {
+        if self.profile.is_some() {
+            "DeepSeek Harness (Desktop)"
+        } else {
+            "DeepSeek Harness"
+        }
+    }
+
+    fn native(&self) -> bool {
+        false
+    }
+
+    fn restart_required(&self) -> bool {
+        true
+    }
+
+    fn requires_client_models(&self) -> bool {
+        true
+    }
+
+    fn platform(&self) -> PlatformId {
+        self.platform
+    }
+
+    fn resolve_path(&self, home: &Path) -> PathBuf {
+        match self.profile {
+            // dsh 0.1.7+ keeps a profile's providers in its patch document, not
+            // in the home-level `settings.yaml` it no longer reads.
+            Some(profile) => home
+                .join(".dsh")
+                .join("profiles")
+                .join(profile)
+                .join("cordis.patch.yml"),
+            None => home.join(".dsh").join("settings.yaml"),
+        }
+    }
+
+    fn resolve_path_with_context(&self, home: &Path, paths: &RouteConfigPathContext) -> PathBuf {
+        paths
+            .deepseek_harness_config_path
+            .clone()
+            .unwrap_or_else(|| self.resolve_path(home))
+    }
+
+    /// The legacy `~/.dsh/settings.yaml` document: a mapping whose
+    /// `llm-pi-ai.providers` holds one entry per provider.
+    fn render(
+        &self,
+        path: &Path,
+        existing: Option<&[u8]>,
+        input: &RouteConfigInput,
+    ) -> Result<Vec<u8>, AppError> {
+        if self.profile.is_some() {
+            self.render_profile_patch(path, existing, input)
+        } else {
+            self.render_settings(path, existing, input)
+        }
     }
 
     fn inspect(&self, _path: &Path, existing: Option<&[u8]>) -> TargetInspection {
@@ -338,30 +548,35 @@ impl TargetAdapter for DeepSeekHarnessAdapter {
         let Ok(config) = serde_yaml::from_str::<Value>(content) else {
             return TargetInspection::invalid();
         };
-        let Some(root) = config.as_mapping() else {
-            return TargetInspection::invalid();
-        };
 
-        // Check for managed marker with matching platform
-        let managed = root
-            .get(&Value::String("llm-pi-ai".to_string()))
-            .and_then(Value::as_mapping)
-            .and_then(|llm| llm.get(&Value::String("providers".to_string())))
-            .and_then(Value::as_mapping)
-            .is_some_and(|providers| {
-                providers.values().any(|entry| {
-                    entry
-                        .get("aiSwitch")
-                        .and_then(|v| v.get("managed"))
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                        && entry
-                            .get("aiSwitch")
-                            .and_then(|v| v.get("platform"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| value == self.platform.as_str())
+        // Check for the managed marker with a matching platform. The two stores
+        // keep providers in different places: `settings.yaml` nests them under
+        // `llm-pi-ai.providers`, a profile patch document under the `llm-pi-ai`
+        // entry's `config.providers`.
+        let managed = if self.profile.is_some() {
+            config
+                .as_sequence()
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.get("id").and_then(Value::as_str) == Some("llm-pi-ai"))
                 })
-            });
+                .and_then(|entry| entry.get("config"))
+                .and_then(Value::as_mapping)
+                .and_then(|patch| patch.get("providers"))
+                .and_then(Value::as_mapping)
+                .is_some_and(|providers| self.holds_managed_platform(providers))
+        } else {
+            match config.as_mapping() {
+                Some(root) => root
+                    .get(&Value::String("llm-pi-ai".to_string()))
+                    .and_then(Value::as_mapping)
+                    .and_then(|llm| llm.get(&Value::String("providers".to_string())))
+                    .and_then(Value::as_mapping)
+                    .is_some_and(|providers| self.holds_managed_platform(providers)),
+                None => return TargetInspection::invalid(),
+            }
+        };
 
         TargetInspection::valid(managed)
     }
@@ -704,6 +919,140 @@ llm-pi-ai:
                 .inspect(path, Some(claude_only))
                 .file_status,
             "managed"
+        );
+    }
+
+    fn desktop_codex_adapter() -> std::sync::Arc<dyn TargetAdapter> {
+        TargetAdapterRegistry::new()
+            .by_client_and_platform("deepseek_harness_desktop", PlatformId::Codex)
+            .expect("deepseek_harness_desktop codex adapter")
+    }
+
+    fn desktop_claude_adapter() -> std::sync::Arc<dyn TargetAdapter> {
+        TargetAdapterRegistry::new()
+            .by_client_and_platform("deepseek_harness_desktop", PlatformId::Claude)
+            .expect("deepseek_harness_desktop claude adapter")
+    }
+
+    /// The desktop app runs its own `desktop` profile, and from 0.1.7 on dsh
+    /// keeps a profile's providers in its patch document rather than in the
+    /// home-level `settings.yaml` it no longer reads.
+    #[test]
+    fn desktop_resolves_to_the_desktop_profile_patch_document() {
+        let home = Path::new("/home/user");
+        assert_eq!(
+            desktop_codex_adapter().resolve_path(home),
+            home.join(".dsh")
+                .join("profiles")
+                .join("desktop")
+                .join("cordis.patch.yml")
+        );
+        // The web/CLI variant keeps writing the legacy document.
+        assert_eq!(
+            codex_adapter().resolve_path(home),
+            home.join(".dsh").join("settings.yaml")
+        );
+    }
+
+    #[test]
+    fn desktop_render_writes_one_cordis_patch_entry() {
+        let bytes = desktop_codex_adapter()
+            .render(
+                Path::new("cordis.patch.yml"),
+                None,
+                &input(&["gpt-5.6-sol"]),
+            )
+            .expect("render");
+        let parsed: Value = serde_yaml::from_slice(&bytes).expect("valid YAML");
+        let entries = parsed.as_sequence().expect("a sequence of patch entries");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], "llm-pi-ai");
+        assert_eq!(entries[0]["name"], "@deepseek-ai/dsh-llm-pi-ai");
+
+        let provider = &entries[0]["config"]["providers"]["ai-switch-codex"];
+        assert_eq!(provider["api"], "openai-completions");
+        assert_eq!(provider["baseURL"], "http://127.0.0.1:19527/v1");
+        assert_eq!(
+            provider["headers"]["Authorization"],
+            "Bearer sk-ai-switch-test"
+        );
+        assert_eq!(provider["models"][0]["id"], "gpt-5.6-sol");
+        assert_eq!(provider["aiSwitch"]["managed"], true);
+        assert_eq!(provider["aiSwitch"]["platform"], "codex");
+    }
+
+    /// The patch layer replaces the whole `config` of the row it targets, so a
+    /// second `llm-pi-ai` row would silently discard one of the two providers.
+    #[test]
+    fn desktop_render_merges_into_the_existing_llm_pi_ai_row() {
+        let existing = br#"
+- id: some-plugin
+  name: '@deepseek-ai/dsh-schedule'
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      hand-added:
+        displayName: Hand added
+        baseURL: https://example.com
+"#;
+        let bytes = desktop_codex_adapter()
+            .render(
+                Path::new("cordis.patch.yml"),
+                Some(existing),
+                &input(&["gpt-5.6-sol"]),
+            )
+            .expect("render");
+        let parsed: Value = serde_yaml::from_slice(&bytes).expect("valid YAML");
+        let entries = parsed.as_sequence().expect("a sequence of patch entries");
+
+        // Still exactly one llm-pi-ai row, and the sibling row survives.
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.get("id").and_then(Value::as_str) == Some("llm-pi-ai"))
+                .count(),
+            1
+        );
+        assert_eq!(entries[0]["id"], "some-plugin");
+
+        let providers = &entries[1]["config"]["providers"];
+        assert_eq!(providers["hand-added"]["displayName"], "Hand added");
+        assert_eq!(
+            providers["ai-switch-codex"]["baseURL"],
+            "http://127.0.0.1:19527/v1"
+        );
+    }
+
+    #[test]
+    fn desktop_inspection_reads_the_managed_marker_from_the_patch_entry() {
+        let path = Path::new("cordis.patch.yml");
+        assert_eq!(
+            desktop_codex_adapter().inspect(path, None).file_status,
+            "missing"
+        );
+
+        let managed = br#"
+- id: llm-pi-ai
+  config:
+    providers:
+      ai-switch-codex:
+        aiSwitch:
+          managed: true
+          platform: codex
+"#;
+        assert_eq!(
+            desktop_codex_adapter()
+                .inspect(path, Some(managed))
+                .file_status,
+            "managed"
+        );
+        assert_eq!(
+            desktop_claude_adapter()
+                .inspect(path, Some(managed))
+                .file_status,
+            "unmanaged"
         );
     }
 }

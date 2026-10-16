@@ -174,6 +174,11 @@ impl TargetAdapterRegistry {
                 Arc::new(ZCodeAdapter::claude()),
                 Arc::new(DeepSeekHarnessAdapter::codex()),
                 Arc::new(DeepSeekHarnessAdapter::claude()),
+                // The official desktop app runs its own `desktop` profile, so
+                // it is a second install with a second config document rather
+                // than the same client under another name.
+                Arc::new(DeepSeekHarnessAdapter::desktop_codex()),
+                Arc::new(DeepSeekHarnessAdapter::desktop_claude()),
                 Arc::new(WorkBuddyAdapter::codex()),
                 Arc::new(WorkBuddyAdapter::claude()),
                 Arc::new(WorkBuddyAdapter::workbuddy_ai_codex()),
@@ -738,6 +743,7 @@ api_key = "legacy-key"
                 "codex",
                 "zcode",
                 "deepseek_harness",
+                "deepseek_harness_desktop",
                 "workbuddy",
                 "workbuddy_ai",
                 "codebuddy_cli",
@@ -769,6 +775,7 @@ api_key = "legacy-key"
                 "claude_code",
                 "zcode",
                 "deepseek_harness",
+                "deepseek_harness_desktop",
                 "workbuddy",
                 "workbuddy_ai",
                 "codebuddy_cli",
