@@ -43,6 +43,35 @@ export function codexBaselineReasoningLevels(model: string): readonly string[] {
 }
 
 /**
+ * Reasoning ladder advertised to **third-party clients** (ZCode, WorkBuddy,
+ * CodeBuddy) for a model whose account declared no reasoning efforts.
+ *
+ * Mirrors `default_third_party_reasoning_levels` on the Rust side. Starts from the
+ * conservative `low`/`medium`/`high`; DeepSeek‑V4 upstreams additionally get a
+ * `max` tier — the same ladder the backend writes into the client configs, so the
+ * editor preview matches what the catalog produces.
+ */
+const CODEX_THIRD_PARTY_DEFAULT_REASONING_LEVELS: readonly string[] = [
+  "low",
+  "medium",
+  "high",
+];
+
+export function thirdPartyDefaultReasoningLevels(
+  upstreamModel: string,
+): readonly string[] {
+  const name = upstreamModel.trim().toLowerCase();
+  const bare = name.slice(name.lastIndexOf("/") + 1);
+  const isDeepSeekV4 =
+    name.startsWith("deepseek-v4") || bare.startsWith("deepseek-v4");
+  const base = [...CODEX_THIRD_PARTY_DEFAULT_REASONING_LEVELS];
+  if (isDeepSeekV4) {
+    base.push("max");
+  }
+  return base;
+}
+
+/**
  * What one row will actually advertise. An absent *or empty* list means "use the
  * baseline": the editor writes an empty list when the user unticks every box,
  * and an empty effort menu would leave the client with nothing to pick.
@@ -53,6 +82,23 @@ export function codexEffectiveReasoningLevels(
 ): readonly string[] {
   const normalized = normalizeCodexReasoningLevels(declared);
   return normalized.length > 0 ? normalized : codexBaselineReasoningLevels(model);
+}
+
+/**
+ * The tier a client should preselect for one row. Mirrors the Rust
+ * `codex_reasoning_metadata` default: the **highest** advertised tier, so a model
+ * opens at its deepest reasoning effort rather than a conservative default. The
+ * list is already ordered low → high, so the last entry is the top tier.
+ *
+ * Returns `null` when the row has no tiers (audio, image, plain chat) — there is
+ * nothing to preselect.
+ */
+export function codexDefaultReasoningLevel(
+  model: string,
+  declared: string[] | null | undefined,
+): string | null {
+  const levels = codexEffectiveReasoningLevels(model, declared);
+  return levels.length > 0 ? levels[levels.length - 1] : null;
 }
 
 /** Trim, lowercase, dedupe and drop anything the bridges cannot express — the

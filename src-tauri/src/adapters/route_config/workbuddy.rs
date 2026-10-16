@@ -229,7 +229,13 @@ impl WorkBuddyAdapter {
     }
 
     fn model_record(&self, model: &ClientModel, url: &str, api_key: &str) -> Value {
-        json!({
+        // Per-model reasoning tiers. WorkBuddy's `models.json` has no
+        // enable/disable boolean for reasoning — listing the tiers is what
+        // surfaces the control in the UI. `reasoning_levels` is never empty
+        // here: `resolve_client_models` fills a default ladder for any model
+        // the account left undeclared, so an unmatched relay model (e.g.
+        // stepfun) still offers low/medium/high instead of no control.
+        let mut record = json!({
             "id": model.id,
             "name": format!("{} {}", self.display_name_prefix, model.id),
             "vendor": "Custom",
@@ -239,8 +245,18 @@ impl WorkBuddyAdapter {
             "maxOutputTokens": model.max_output_tokens,
             "supportsToolCall": true,
             "supportsImages": model.supports_image_input,
+            "reasoningEfforts": model.reasoning_levels,
             "aiSwitch": { "managed": true, "platform": self.platform.as_str() },
-        })
+        });
+        // Preselect the deepest available tier. The list is ordered
+        // low → high, so the last entry is the model's top effort (e.g. `max`
+        // for a DeepSeek‑V4 relay). WorkBuddy reads this field to preselect the
+        // reasoning effort, so the model opens at its highest tier rather than
+        // the client's own quiet default.
+        if let Some(default) = model.reasoning_levels.last() {
+            record["defaultReasoningEffort"] = json!(default);
+        }
+        record
     }
 }
 
@@ -473,6 +489,46 @@ mod tests {
             let json: Value = serde_json::from_slice(&bytes).expect("valid JSON");
             assert_eq!(json["models"][0]["supportsImages"], expected);
         }
+    }
+
+    #[test]
+    fn model_record_writes_reasoning_efforts_and_a_highest_tier_default() {
+        let mut row = input(&["deepseek-v4-flash", "gpt-5.6-sol"]);
+        // The account declared nothing, so `resolve_client_models` fills the
+        // default ladder; DeepSeek‑V4 gets the extra `max` tier.
+        row.client_models[0].reasoning_levels =
+            vec!["low".to_string(), "medium".to_string(), "high".to_string(), "max".to_string()];
+        row.client_models[1].reasoning_levels = vec![
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+            "xhigh".to_string(),
+            "max".to_string(),
+            "ultra".to_string(),
+        ];
+
+        let bytes = codex_adapter()
+            .render(Path::new("models.json"), None, &row)
+            .expect("render");
+        let json: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        let records = json["models"].as_array().expect("model records");
+
+        let flash = records
+            .iter()
+            .find(|record| record["id"] == "deepseek-v4-flash")
+            .expect("flash record");
+        assert_eq!(
+            flash["reasoningEfforts"],
+            json!(["low", "medium", "high", "max"])
+        );
+        // Preselected to the deepest tier so the model opens on `max`.
+        assert_eq!(flash["defaultReasoningEffort"], "max");
+
+        let sol = records
+            .iter()
+            .find(|record| record["id"] == "gpt-5.6-sol")
+            .expect("sol record");
+        assert_eq!(sol["defaultReasoningEffort"], "ultra");
     }
 
     #[test]

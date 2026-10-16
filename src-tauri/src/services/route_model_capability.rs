@@ -137,6 +137,50 @@ const LUNA_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"
 const GPT_55_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
 const DEFAULT_REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
 
+/// Reasoning ladder advertised to **third-party clients** (ZCode, WorkBuddy,
+/// CodeBuddy) for a model whose account declared no `reasoning_levels`.
+///
+/// The Codex CLI's own catalog falls back to a per-model profile for such models
+/// (see [`codex_reasoning_profile`]); third-party clients deliberately do *not*
+/// invent a per-model profile. But an *empty* control left the user with nothing
+/// but the client's bare on/off toggle — a stepfun model that simply is not in
+/// the built-in profile table ended up with only "enable/disable" and no way to
+/// pick a tier. A minimal ladder restores that choice. `low`/`medium`/`high` are
+/// all in `RECOGNISED_REASONING_EFFORTS`, so the proxy bridges honour them and
+/// nothing is silently dropped from the request.
+pub(crate) const DEFAULT_THIRD_PARTY_REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
+
+/// Whether the upstream model is a DeepSeek‑V4 family. Matched on the start of
+/// the mapped‑to name so every dated or sized variant (`deepseek-v4-flash-0731`,
+/// `deepseek-v4.1`, …) is covered; relays namespace by vendor, so the last path
+/// segment is tried too.
+fn is_deepseek_v4_upstream(upstream_model: &str) -> bool {
+    let name = upstream_model.trim().to_ascii_lowercase();
+    let bare = name.rsplit('/').next().unwrap_or(name.as_str());
+    name.starts_with("deepseek-v4") || bare.starts_with("deepseek-v4")
+}
+
+/// Reasoning ladder advertised to **third-party clients** for a model whose
+/// account declared no `reasoning_levels`.
+///
+/// Starts from [`DEFAULT_THIRD_PARTY_REASONING_LEVELS`] (`low`/`medium`/`high`);
+/// DeepSeek‑V4 upstreams additionally get a `max` tier. The family carries enough
+/// headroom that the top recognised effort is a real choice rather than
+/// decoration — the user explicitly asked for it — so the ladder grows to
+/// `low`/`medium`/`high`/`max` for those models. `max` is in
+/// `RECOGNISED_REASONING_EFFORTS`, so the bridges honour it end to end and the
+/// request is not silently stripped.
+pub(crate) fn default_third_party_reasoning_levels(upstream_model: &str) -> Vec<String> {
+    let mut levels: Vec<String> = DEFAULT_THIRD_PARTY_REASONING_LEVELS
+        .iter()
+        .map(|level| (*level).to_string())
+        .collect();
+    if is_deepseek_v4_upstream(upstream_model) {
+        levels.push("max".to_string());
+    }
+    levels
+}
+
 /// Context window written into the Codex catalog when a mapping declares none
 /// and its upstream model is not one of the known 1M families.
 ///
@@ -342,12 +386,14 @@ pub(crate) fn codex_reasoning_metadata(
 ) -> (Vec<Value>, String) {
     let profile = codex_reasoning_profile(model);
     let levels = codex_reasoning_levels(model, overrides);
-    // A custom list that drops the profile default would otherwise leave Codex
-    // preselecting an effort it was just told is unavailable.
+    // Preselect the highest advertised tier so a model opens at its deepest
+    // reasoning effort rather than a conservative default. The bridge still maps
+    // the name to a budget, so the only thing that changes is which tier the
+    // client shows selected. `levels` is already the effective list — declared
+    // efforts when the account set them, else the profile ladder — so the last
+    // entry is the model's top tier.
     let default_level = levels
-        .iter()
-        .find(|level| level.as_str() == profile.default_level)
-        .or_else(|| levels.first())
+        .last()
         .map(String::as_str)
         .unwrap_or(profile.default_level)
         .to_string();
@@ -1110,12 +1156,11 @@ mod tests {
     use super::{
         alias_for_model_key, catalog_members, codex_default_context_window,
         codex_effective_context_window, codex_reasoning_levels, codex_reasoning_metadata,
-        codex_reasoning_profile, known_upstream_models, mapping_declares_one_m_context,
-        model_matches, model_state_key, parse_model_capability, requested_model_from_body,
-        resolve_mapping_target, supports_requested_capability, supports_requested_model,
-        AdvertisedModel,
-        CatalogMemberInput, ModelCapability, ModelCatalogMember, ModelMatchMode,
-        CODEX_ONE_M_CONTEXT_WINDOW,
+        codex_reasoning_profile, default_third_party_reasoning_levels, known_upstream_models,
+        mapping_declares_one_m_context, model_matches, model_state_key, parse_model_capability,
+        requested_model_from_body, resolve_mapping_target, supports_requested_capability,
+        supports_requested_model, AdvertisedModel, CatalogMemberInput, ModelCapability,
+        ModelCatalogMember, ModelMatchMode, CODEX_ONE_M_CONTEXT_WINDOW,
     };
     use crate::models::route_credential::{ModelMapping, FALLBACK_MODEL_ALIAS};
     use crate::services::route_pool_model_mode::PoolModelMode;
@@ -1376,6 +1421,35 @@ mod tests {
     }
 
     #[test]
+    fn third_party_default_ladder_adds_max_for_deepseek_v4() {
+        // An unmatched relay model gets the conservative low/medium/high ladder.
+        assert_eq!(
+            default_third_party_reasoning_levels("some-audio-model"),
+            vec!["low", "medium", "high"]
+        );
+        // DeepSeek‑V4 upstreams additionally offer `max` — every dated or sized
+        // variant and every vendor-namespaced path is covered.
+        for upstream in [
+            "deepseek-v4",
+            "deepseek-v4-flash-0731",
+            "DeepSeek-V4.1",
+            "z-ai/deepseek-v4-flash",
+        ] {
+            assert_eq!(
+                default_third_party_reasoning_levels(upstream),
+                vec!["low", "medium", "high", "max"],
+                "upstream={upstream}"
+            );
+        }
+        // Other 1M families keep the conservative ladder — only deepseek-v4 gets
+        // the extra `max` tier, per the user's request.
+        assert_eq!(
+            default_third_party_reasoning_levels("glm-5.3"),
+            vec!["low", "medium", "high"]
+        );
+    }
+
+    #[test]
     fn codex_reasoning_levels_normalize_a_custom_list() {
         let declared = [
             " High ".to_string(),
@@ -1413,9 +1487,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_reasoning_metadata_keeps_the_default_inside_a_custom_list() {
-        // gpt-5.5 defaults to medium; a list without it must not preselect an
-        // effort the client was just told is unavailable.
+    fn codex_reasoning_metadata_preselects_the_highest_tier_in_a_custom_list() {
+        // A declared list no longer preselects the profile default (medium for
+        // gpt-5.5) when that effort is absent — it preselects the highest tier
+        // the list actually offers.
         let (levels, default_level) =
             codex_reasoning_metadata("gpt-5.5", Some(&["xhigh".to_string(), "max".to_string()]));
         assert_eq!(
@@ -1425,7 +1500,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["xhigh", "max"]
         );
-        assert_eq!(default_level, "xhigh");
+        assert_eq!(default_level, "max");
 
         let (_, kept) =
             codex_reasoning_metadata("gpt-5.5", Some(&["high".to_string(), "medium".to_string()]));
@@ -1454,7 +1529,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["medium", "max"]
         );
-        assert_eq!(models[0]["default_reasoning_level"], "medium");
+        assert_eq!(models[0]["default_reasoning_level"], "max");
 
         // An untouched row keeps the shipped defaults.
         assert_eq!(models[1]["context_window"], 128_000);
@@ -1637,6 +1712,20 @@ mod tests {
             as_json(codex_reasoning_profile("some-relay-model").levels),
             fixture["default_reasoning_levels"]
         );
+        // The third-party client ladder: conservative by default, with DeepSeek‑V4
+        // getting the extra `max` tier. Mirrors `thirdPartyDefaultReasoningLevels`
+        // on the TypeScript side.
+        assert_eq!(
+            Value::from(default_third_party_reasoning_levels("some-relay-model")),
+            fixture["third_party_default_reasoning_levels"]
+        );
+        let extra = default_third_party_reasoning_levels("deepseek-v4-flash")
+            .last()
+            .expect("a tier");
+        let expected_extra = fixture["third_party_deepseek_v4_extra_reasoning_level"]
+            .as_str()
+            .expect("extra tier");
+        assert_eq!(extra.as_str(), expected_extra);
         assert_eq!(
             fixture["default_context_window"],
             Value::from(super::CODEX_DEFAULT_CONTEXT_WINDOW)

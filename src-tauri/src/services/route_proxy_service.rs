@@ -17862,10 +17862,10 @@ data: [DONE]\n\n";
                 .collect::<Vec<_>>(),
             vec!["low", "medium", "high", "xhigh"]
         );
-        assert_eq!(data[0]["default_reasoning_level"].as_str(), Some("medium"));
+        // Nothing was declared on the mapping, so we advertise the upstream
+        // baseline ladder and preselect its highest tier (xhigh) by default.
+        assert_eq!(data[0]["default_reasoning_level"].as_str(), Some("xhigh"));
         assert_eq!(data[1].get("id").and_then(Value::as_str), Some("gpt-5"));
-        // Nothing was declared, so the upstream's own default is stated. The
-        // client cannot derive it — it never sees the mapped-to name.
         assert_eq!(data[0]["context_window"].as_u64(), Some(128_000));
         assert!(payload.get("models").is_none());
 
@@ -17919,8 +17919,9 @@ data: [DONE]\n\n";
                 .collect::<Vec<_>>(),
             vec!["xhigh", "max"]
         );
-        // gpt-5.5 defaults to medium, which the custom list drops.
-        assert_eq!(data[0]["default_reasoning_level"].as_str(), Some("xhigh"));
+        // The mapping declares ["xhigh", "max"], so the highest tier (max) is
+        // preselected rather than the upstream's medium default.
+        assert_eq!(data[0]["default_reasoning_level"].as_str(), Some("max"));
     }
 
     #[test]

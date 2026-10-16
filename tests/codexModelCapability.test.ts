@@ -5,9 +5,11 @@ import {
   codexBaselineReasoningLevels,
   codexContextWindowLabel,
   codexDefaultContextWindow,
+  codexDefaultReasoningLevel,
   codexEffectiveReasoningLevels,
   normalizeCodexContextWindow,
   normalizeCodexReasoningLevels,
+  thirdPartyDefaultReasoningLevels,
   usesCodexBaselineReasoning,
   CODEX_CONTEXT_WINDOW_OPTIONS,
   CODEX_REASONING_LEVEL_OPTIONS,
@@ -184,6 +186,8 @@ describe("codexModelCapability", () => {
       recognised_reasoning_efforts: string[];
       baseline_reasoning_profiles: Record<string, string[]>;
       default_reasoning_levels: string[];
+      third_party_default_reasoning_levels: string[];
+      third_party_deepseek_v4_extra_reasoning_level: string;
       one_m_upstream_prefixes: string[];
       baseline_context_windows: Record<string, number>;
       default_context_window: number;
@@ -197,6 +201,12 @@ describe("codexModelCapability", () => {
     expect([...codexBaselineReasoningLevels("some-relay-model")]).toEqual(
       fixture.default_reasoning_levels,
     );
+    expect([...thirdPartyDefaultReasoningLevels("some-relay-model")]).toEqual(
+      fixture.third_party_default_reasoning_levels,
+    );
+    expect(
+      thirdPartyDefaultReasoningLevels("deepseek-v4-flash").slice(-1)[0],
+    ).toBe(fixture.third_party_deepseek_v4_extra_reasoning_level);
     expect(codexDefaultContextWindow("some-relay-model")).toBe(fixture.default_context_window);
     for (const [model, window] of Object.entries(fixture.baseline_context_windows)) {
       expect(codexDefaultContextWindow(model)).toBe(window);
@@ -204,5 +214,39 @@ describe("codexModelCapability", () => {
     for (const prefix of fixture.one_m_upstream_prefixes) {
       expect(codexDefaultContextWindow(prefix)).toBe(fixture.one_m_context_window);
     }
+  });
+
+  it("gives third-party clients a conservative ladder, DeepSeek-V4 an extra max", () => {
+    expect(thirdPartyDefaultReasoningLevels("some-audio-model")).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+    // Every dated, sized, or vendor-namespaced DeepSeek‑V4 variant gets max.
+    for (const upstream of [
+      "deepseek-v4",
+      "deepseek-v4-flash-0731",
+      "DeepSeek-V4.1",
+      "z-ai/deepseek-v4-flash",
+    ]) {
+      expect(thirdPartyDefaultReasoningLevels(upstream).slice(-1)[0]).toBe("max");
+    }
+    // Other 1M families keep the conservative ladder.
+    expect(thirdPartyDefaultReasoningLevels("glm-5.3")).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+  });
+
+  it("preselects the highest advertised reasoning tier", () => {
+    // A declared list opens on its top tier, not a conservative default.
+    expect(codexDefaultReasoningLevel("gpt-5.5", ["xhigh", "max"])).toBe("max");
+    expect(codexDefaultReasoningLevel("gpt-5.5", ["high", "medium"])).toBe("medium");
+    // No declaration falls back to the baseline ladder, whose top is xhigh.
+    expect(codexDefaultReasoningLevel("gpt-5.5", null)).toBe("xhigh");
+    // An empty declared list also falls back to the baseline (matching the Rust
+    // `codex_reasoning_levels` behaviour), so its top tier is still xhigh.
+    expect(codexDefaultReasoningLevel("gpt-5.5", [])).toBe("xhigh");
   });
 });

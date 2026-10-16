@@ -22,7 +22,7 @@ use crate::services::platform_capability_service::PlatformCapabilityService;
 use crate::services::route_model_capability::{
     advertised_model_catalog_entries, catalog_member_inputs, catalog_members,
     client_facing_model_catalog_entries, codex_default_context_window, codex_model_catalog_payload,
-    normalize_reasoning_levels, parse_model_capability,
+    default_third_party_reasoning_levels, normalize_reasoning_levels, parse_model_capability,
 };
 use crate::services::settings_service::SettingsService;
 use directories::BaseDirs;
@@ -603,18 +603,25 @@ impl RouteConfigService {
                 ),
                 max_output_tokens: CLIENT_MODEL_MAX_OUTPUT_TOKENS,
                 id: model.id,
-                reasoning_levels: if platform == PlatformId::Codex {
-                    // Write exactly what the account declared, after cleanup —
-                    // no baseline-profile fallback. A model the user gave no
-                    // efforts (audio, image, plain chat) then gets an empty
-                    // list, and the third-party client (ZCode / DSH) omits the
-                    // reasoning control entirely instead of showing an invented
-                    // low/medium/high it cannot honour. The Codex CLI's own
-                    // catalog still fills the profile in via
-                    // `codex_reasoning_levels`, which this deliberately is not.
-                    normalize_reasoning_levels(model.reasoning_levels.as_deref())
-                } else {
-                    Vec::new()
+                reasoning_levels: {
+                    // The account's own declaration wins, cleaned up. A model the
+                    // account left undeclared — a stepfun relay model that simply
+                    // is not in the built-in profile table — used to get an empty
+                    // list, which left third-party clients (ZCode, WorkBuddy) with
+                    // no reasoning control at all: only a bare on/off toggle. Fall
+                    // back to a minimal ladder so an unmatched model can still
+                    // pick a tier. `low`/`medium`/`high` are all recognised by the
+                    // bridges, so nothing is silently dropped. DeepSeek‑V4 upstreams
+                    // get an extra `max` tier on top of that ladder. A genuinely
+                    // declared empty list is treated the same as "none declared":
+                    // the user wants the choice, not an empty menu.
+                    let declared =
+                        normalize_reasoning_levels(model.reasoning_levels.as_deref());
+                    if declared.is_empty() {
+                        default_third_party_reasoning_levels(&model.upstream_model)
+                    } else {
+                        declared
+                    }
                 },
                 supports_image_input: model.supports_image_input,
             })
@@ -2213,19 +2220,20 @@ command = "npx"
     }
 
     #[tokio::test]
-    async fn zcode_writes_the_declared_reasoning_levels_verbatim_and_omits_the_block_when_none() {
-        // The third-party ZCode config must mirror the account exactly: a model
-        // that declares efforts gets those efforts (no baseline-profile
-        // padding), and a model that declares none gets no reasoning block at
-        // all — so the client shows a real dropdown or nothing, never an
-        // invented low/medium/high that turns into a bare enable/disable.
+    async fn zcode_writes_the_declared_reasoning_levels_verbatim_and_falls_back_to_a_default_ladder_when_none() {
+        // The third-party ZCode config mirrors the account exactly for models that
+        // declare efforts (no baseline-profile padding). A model that declares
+        // none no longer gets *no* reasoning control — a bare on/off toggle — but
+        // a minimal default ladder, so an unmatched relay model can still pick a
+        // tier. `low`/`medium`/`high` are all recognised by the bridges.
         let fixture = ServiceFixture::new().await;
         seed_codex_pool_member_with_config(
             &fixture.pool,
             &serde_json::json!({
                 "model_mappings": [
                     { "from": "gpt-5.6-sol", "to": "gpt-5.6-sol", "reasoning_levels": ["medium", "max"] },
-                    { "from": "some-audio-model", "to": "some-audio-model" }
+                    { "from": "some-audio-model", "to": "some-audio-model" },
+                    { "from": "ds-flash", "to": "deepseek-v4-flash", "reasoning_levels": [] }
                 ]
             })
             .to_string(),
@@ -2263,13 +2271,20 @@ command = "npx"
             rule_for("gpt-5.6-sol")["config"]["optionSpecs"]["reasoningLevel"],
             serde_json::json!({ "values": ["medium", "max"] })
         );
-        // No declaration → no reasoning block, so ZCode renders no control.
-        assert!(
-            rule_for("some-audio-model")["config"]["optionSpecs"]
-                .get("reasoningLevel")
-                .is_none(),
-            "a model with no declared efforts must not get a reasoning block: {}",
+        // No declaration → a default ladder (not an empty block), so ZCode offers
+        // real tiers instead of a bare enable/disable.
+        assert_eq!(
+            rule_for("some-audio-model")["config"]["optionSpecs"]["reasoningLevel"],
+            serde_json::json!({ "values": ["low", "medium", "high"] }),
+            "an undeclared model must get the default reasoning ladder: {}",
             rule_for("some-audio-model")
+        );
+        // A DeepSeek‑V4 upstream adds a `max` tier to that ladder.
+        assert_eq!(
+            rule_for("ds-flash")["config"]["optionSpecs"]["reasoningLevel"],
+            serde_json::json!({ "values": ["low", "medium", "high", "max"] }),
+            "a deepseek-v4 upstream must get the max tier in its ladder: {}",
+            rule_for("ds-flash")
         );
     }
 
@@ -2932,8 +2947,9 @@ model_provider = "ai-switch"
                 .collect::<Vec<_>>(),
             vec!["medium", "max"]
         );
-        // sol's baseline default is low, which this list drops.
-        assert_eq!(model["default_reasoning_level"], "medium");
+        // The catalog now preselects the highest advertised tier, so a declared
+        // list of `medium`/`max` opens on `max` rather than a conservative default.
+        assert_eq!(model["default_reasoning_level"], "max");
     }
 
     #[tokio::test]
