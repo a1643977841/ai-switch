@@ -137,6 +137,23 @@ const LUNA_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"
 const GPT_55_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
 const DEFAULT_REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
 
+/// The ladder a model the tables describe ships, or `None` for a model they do
+/// not describe at all.
+///
+/// The distinction is the point: a relay's own model id must keep the
+/// conservative generic ladder, while a model we know — `gpt-6-astra`, say —
+/// has a real one that Codex is already shown.
+pub(crate) fn baseline_reasoning_levels(model: &str) -> Option<&'static [&'static str]> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-6-astra" => Some(GPT_6_ASTRA_REASONING_LEVELS),
+        "gpt-5.6-sol" => Some(SOL_REASONING_LEVELS),
+        "gpt-5.6-terra" => Some(TERRA_REASONING_LEVELS),
+        "gpt-5.6-luna" => Some(LUNA_REASONING_LEVELS),
+        "gpt-5.5" => Some(GPT_55_REASONING_LEVELS),
+        _ => None,
+    }
+}
+
 /// Reasoning ladder advertised to **third-party clients** (ZCode, WorkBuddy,
 /// CodeBuddy) for a model whose account declared no `reasoning_levels`.
 ///
@@ -163,7 +180,13 @@ fn is_deepseek_v4_upstream(upstream_model: &str) -> bool {
 /// Reasoning ladder advertised to **third-party clients** for a model whose
 /// account declared no `reasoning_levels`.
 ///
-/// Starts from [`DEFAULT_THIRD_PARTY_REASONING_LEVELS`] (`low`/`medium`/`high`);
+/// A model the profile table describes advertises **its own** ladder. Codex is
+/// already shown all six of `gpt-6-astra`'s tiers, and a third-party client
+/// offered only the generic three read as "this model has no reasoning control"
+/// — the same model, two different menus, depending on which client asked.
+///
+/// Anything the table does not know — a relay's own model id — keeps the
+/// conservative [`DEFAULT_THIRD_PARTY_REASONING_LEVELS`] (`low`/`medium`/`high`).
 /// DeepSeek‑V4 upstreams additionally get a `max` tier. The family carries enough
 /// headroom that the top recognised effort is a real choice rather than
 /// decoration — the user explicitly asked for it — so the ladder grows to
@@ -171,6 +194,9 @@ fn is_deepseek_v4_upstream(upstream_model: &str) -> bool {
 /// `RECOGNISED_REASONING_EFFORTS`, so the bridges honour it end to end and the
 /// request is not silently stripped.
 pub(crate) fn default_third_party_reasoning_levels(upstream_model: &str) -> Vec<String> {
+    if let Some(levels) = baseline_reasoning_levels(upstream_model) {
+        return levels.iter().map(|level| (*level).to_string()).collect();
+    }
     let mut levels: Vec<String> = DEFAULT_THIRD_PARTY_REASONING_LEVELS
         .iter()
         .map(|level| (*level).to_string())
@@ -304,31 +330,14 @@ pub(crate) fn mapping_declares_one_m_context(
 }
 
 pub(crate) fn codex_reasoning_profile(model: &str) -> CodexReasoningProfile {
-    match model.trim().to_ascii_lowercase().as_str() {
-        "gpt-6-astra" => CodexReasoningProfile {
-            levels: GPT_6_ASTRA_REASONING_LEVELS,
-            default_level: "medium",
-        },
-        "gpt-5.6-sol" => CodexReasoningProfile {
-            levels: SOL_REASONING_LEVELS,
-            default_level: "low",
-        },
-        "gpt-5.6-terra" => CodexReasoningProfile {
-            levels: TERRA_REASONING_LEVELS,
-            default_level: "medium",
-        },
-        "gpt-5.6-luna" => CodexReasoningProfile {
-            levels: LUNA_REASONING_LEVELS,
-            default_level: "medium",
-        },
-        "gpt-5.5" => CodexReasoningProfile {
-            levels: GPT_55_REASONING_LEVELS,
-            default_level: "medium",
-        },
-        _ => CodexReasoningProfile {
-            levels: DEFAULT_REASONING_LEVELS,
-            default_level: "medium",
-        },
+    let key = model.trim().to_ascii_lowercase();
+    let default_level = match key.as_str() {
+        "gpt-5.6-sol" => "low",
+        _ => "medium",
+    };
+    CodexReasoningProfile {
+        levels: baseline_reasoning_levels(&key).unwrap_or(DEFAULT_REASONING_LEVELS),
+        default_level,
     }
 }
 
@@ -1446,6 +1455,26 @@ mod tests {
         // the extra `max` tier, per the user's request.
         assert_eq!(
             default_third_party_reasoning_levels("glm-5.3"),
+            vec!["low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn a_known_baseline_model_advertises_its_own_ladder_to_third_party_clients() {
+        // Codex is shown all six of astra's tiers; a third-party client that only
+        // ever saw the generic three read as "this model has no reasoning
+        // control" — one model, two menus, depending on who asked.
+        assert_eq!(
+            default_third_party_reasoning_levels("gpt-6-astra"),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            default_third_party_reasoning_levels("gpt-5.6-luna"),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        // A relay's own id is still unknown, so it keeps the conservative three.
+        assert_eq!(
+            default_third_party_reasoning_levels("some-relay-model"),
             vec!["low", "medium", "high"]
         );
     }

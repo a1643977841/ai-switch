@@ -46,7 +46,10 @@ export function codexBaselineReasoningLevels(model: string): readonly string[] {
  * Reasoning ladder advertised to **third-party clients** (ZCode, WorkBuddy,
  * CodeBuddy) for a model whose account declared no reasoning efforts.
  *
- * Mirrors `default_third_party_reasoning_levels` on the Rust side. Starts from the
+ * Mirrors `default_third_party_reasoning_levels` on the Rust side. A model the
+ * profile table describes advertises **its own** ladder — Codex already shows all
+ * six of `gpt-6-astra`'s tiers, and the generic three would read as "no reasoning
+ * control" on a third-party client. Anything the table does not know keeps the
  * conservative `low`/`medium`/`high`; DeepSeek‑V4 upstreams additionally get a
  * `max` tier — the same ladder the backend writes into the client configs, so the
  * editor preview matches what the catalog produces.
@@ -61,6 +64,10 @@ export function thirdPartyDefaultReasoningLevels(
   upstreamModel: string,
 ): readonly string[] {
   const name = upstreamModel.trim().toLowerCase();
+  const baseline = CODEX_BASELINE_REASONING_PROFILES[name];
+  if (baseline) {
+    return baseline;
+  }
   const bare = name.slice(name.lastIndexOf("/") + 1);
   const isDeepSeekV4 =
     name.startsWith("deepseek-v4") || bare.startsWith("deepseek-v4");

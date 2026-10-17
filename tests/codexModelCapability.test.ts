@@ -199,6 +199,11 @@ describe("codexModelCapability", () => {
     for (const [model, levels] of Object.entries(fixture.baseline_reasoning_profiles)) {
       expect([...codexBaselineReasoningLevels(model)]).toEqual(levels);
     }
+    // A known model keeps its own ladder on third-party clients too — otherwise
+    // the same model offers six tiers on Codex and three on WorkBuddy.
+    for (const [model, levels] of Object.entries(fixture.baseline_reasoning_profiles)) {
+      expect([...thirdPartyDefaultReasoningLevels(model)]).toEqual(levels);
+    }
     expect([...codexBaselineReasoningLevels("some-relay-model")]).toEqual(
       fixture.default_reasoning_levels,
     );
@@ -234,6 +239,32 @@ describe("codexModelCapability", () => {
     }
     // Other 1M families keep the conservative ladder.
     expect(thirdPartyDefaultReasoningLevels("glm-5.3")).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+  });
+
+  it("gives a known baseline model its own ladder on third-party clients", () => {
+    // Codex advertises all six of astra's tiers; a third-party client used to get
+    // only the generic three, which read as "this model has no reasoning control".
+    expect(thirdPartyDefaultReasoningLevels("gpt-6-astra")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+    ]);
+    expect(thirdPartyDefaultReasoningLevels("gpt-5.6-luna")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    // A relay's own id is still unknown, so it keeps the conservative three.
+    expect(thirdPartyDefaultReasoningLevels("some-relay-model")).toEqual([
       "low",
       "medium",
       "high",
