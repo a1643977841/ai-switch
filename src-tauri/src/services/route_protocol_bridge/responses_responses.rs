@@ -3,6 +3,7 @@ use super::common::{
     response_tool_namespace, ResponsesToolNamespaces,
 };
 use super::TransformedBridgeResponse;
+use crate::services::response_failure_service::stamp_context_length_exceeded_code;
 use serde_json::{Map, Value};
 
 pub(super) fn responses_request_to_responses(body: &[u8]) -> Result<Vec<u8>, String> {
@@ -130,7 +131,7 @@ pub(super) fn responses_response_to_responses(
     body: &[u8],
     tool_namespaces: &ResponsesToolNamespaces,
 ) -> Result<TransformedBridgeResponse, String> {
-    if !(200..300).contains(&status) || tool_namespaces.is_empty() {
+    if !(200..300).contains(&status) {
         return Ok(TransformedBridgeResponse {
             body: body.to_vec(),
             content_type: content_type.map(str::to_string),
@@ -146,9 +147,32 @@ pub(super) fn responses_response_to_responses(
         });
     }
 
-    let value = serde_json::from_slice::<Value>(body)
-        .map_err(|error| format!("Responses response JSON is invalid: {error}"))?;
-    let value = restore_tool_namespaces(value, tool_namespaces);
+    // An empty namespace map no longer short-circuits the whole bridge: a
+    // `response.failed` document with `code: null` and only a prose message
+    // still has to gain the structured code Codex compacts on. The record is
+    // parsed, but if neither rewrite applies the upstream's own bytes go back
+    // untouched, so the documented passthrough stays byte-for-byte.
+    let original = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        // Without a namespace to restore an unparseable body was always passed
+        // through verbatim; with one, a 200 that is not JSON is still a broken
+        // upstream response and the caller has to hear about it.
+        Err(_) if tool_namespaces.is_empty() => {
+            return Ok(TransformedBridgeResponse {
+                body: body.to_vec(),
+                content_type: content_type.map(str::to_string),
+            });
+        }
+        Err(error) => return Err(format!("Responses response JSON is invalid: {error}")),
+    };
+    let mut value = restore_tool_namespaces(original.clone(), tool_namespaces);
+    stamp_context_length_exceeded_code(&mut value);
+    if value == original {
+        return Ok(TransformedBridgeResponse {
+            body: body.to_vec(),
+            content_type: content_type.map(str::to_string),
+        });
+    }
     Ok(TransformedBridgeResponse {
         body: serde_json::to_vec(&value)
             .map_err(|error| format!("Could not serialize Responses response: {error}"))?,
@@ -235,11 +259,20 @@ pub(super) fn responses_sse_block_to_responses(
     if data.is_empty() || data == "[DONE]" {
         return Ok(Some(block.to_string()));
     }
-    // This path only rewrites tool names, so a record we cannot parse is
-    // forwarded untouched instead of failing the whole stream.
-    let Ok(value) = serde_json::from_str::<Value>(&data) else {
+    // This path only rewrites tool names and the structured context-limit
+    // code, so a record we cannot parse is forwarded untouched instead of
+    // failing the whole stream.
+    let Ok(original) = serde_json::from_str::<Value>(&data) else {
         return Ok(Some(block.to_string()));
     };
+    let mut value = restore_tool_namespaces(original.clone(), tool_namespaces);
+    stamp_context_length_exceeded_code(&mut value);
+    if value == original {
+        // Nothing to rewrite: return the record exactly as it arrived, keeping
+        // the upstream's key order and spacing. This is what lets the bridge
+        // run on every record without losing its byte-for-byte passthrough.
+        return Ok(Some(block.to_string()));
+    }
     let mut output = String::new();
     for line in block
         .lines()
@@ -250,7 +283,7 @@ pub(super) fn responses_sse_block_to_responses(
     }
     output.push_str("data: ");
     output.push_str(
-        &serde_json::to_string(&restore_tool_namespaces(value, tool_namespaces))
+        &serde_json::to_string(&value)
             .map_err(|error| format!("Could not serialize Responses SSE data: {error}"))?,
     );
     Ok(Some(output))
@@ -266,6 +299,42 @@ fn looks_like_sse(body: &[u8]) -> bool {
 mod tests {
     use super::responses_request_to_responses;
     use serde_json::{json, Value};
+
+    /// The live gateway's null-code context rejection can also arrive over an
+    /// upstream that already speaks Responses. This bridge only rewrites tool
+    /// names, so without an explicit rule the `code: null` reaches Codex
+    /// unchanged and the compaction path never fires.
+    #[test]
+    fn a_null_code_context_rejection_gains_the_structured_code() {
+        use super::responses_response_to_responses;
+
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":null,\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\"}}}\n\n"
+        );
+
+        let converted = responses_response_to_responses(
+            200,
+            Some("text/event-stream"),
+            body.as_bytes(),
+            &Default::default(),
+        )
+        .expect("sse conversion");
+        let text = String::from_utf8_lossy(&converted.body);
+        let failed: Value = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("response.failed"))
+            .expect("response.failed event");
+        assert_eq!(
+            failed
+                .pointer("/response/error/code")
+                .and_then(Value::as_str),
+            Some("context_length_exceeded"),
+            "Codex can only compact on the structured code: {failed}"
+        );
+    }
 
     fn converted_request(body: Value) -> Value {
         let body = serde_json::to_vec(&body).expect("request json");

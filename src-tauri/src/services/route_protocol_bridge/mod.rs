@@ -348,7 +348,8 @@ pub fn transform_response_with_tool_namespaces(
 #[derive(Debug)]
 pub(crate) enum IncrementalResponseBridge {
     /// Responses → Responses. A byte-for-byte passthrough until a tool namespace
-    /// has to be restored, which is a per-record rewrite.
+    /// or a prose-only context-limit rejection has to be rewritten, both of
+    /// which are per-record rewrites.
     ResponsesToResponses {
         tool_namespaces: BTreeMap<String, String>,
     },
@@ -382,11 +383,11 @@ impl IncrementalResponseBridge {
     pub(crate) fn push_block(&mut self, block: &str) -> Result<Option<String>, String> {
         match self {
             Self::ResponsesToResponses { tool_namespaces } => {
-                if tool_namespaces.is_empty() {
-                    // The buffered path is a byte-for-byte passthrough here, so
-                    // re-serializing would only reorder keys for nothing.
-                    return Ok(Some(format!("{block}\n\n")));
-                }
+                // No empty-namespace fast path: the block converter still has to
+                // see the record so a `response.failed` carrying only a prose
+                // context-limit message can gain the structured code. It returns
+                // the block verbatim whenever neither rewrite applies, so this
+                // stays a byte-for-byte passthrough for untouched records.
                 Ok(
                     responses_responses::responses_sse_block_to_responses(block, tool_namespaces)?
                         .map(|converted| format!("{converted}\n\n")),
@@ -1826,6 +1827,57 @@ mod tests {
 
         assert_eq!(output["output"][0]["name"], "open");
         assert_eq!(output["output"][0]["namespace"], "mcp__browser__");
+    }
+
+    /// The incremental Responses → Responses bridge used to short-circuit an
+    /// empty namespace map, forwarding every record verbatim. That skipped the
+    /// structured context-limit stamp the buffered path now always applies, so
+    /// the live Codex stream kept Codex's own `stream disconnected` verdict
+    /// instead of the recognized `response.failed`. The block has to reach the
+    /// converter even with no namespace to restore.
+    #[test]
+    fn incremental_responses_bridge_stamps_a_null_code_context_rejection() {
+        use super::IncrementalResponseBridge;
+
+        // An untouched record must still come back byte-for-byte: the bridge may
+        // only add the code, never reorder the stream.
+        let created_block = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}"
+        );
+        let failure_block = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":null,\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\"}}}"
+        );
+
+        let mut bridge = IncrementalResponseBridge::new(
+            ProtocolBridgeKind::ResponsesToResponses,
+            &BTreeMap::new(),
+        )
+        .expect("incremental bridge");
+
+        let created = bridge
+            .push_block(created_block)
+            .expect("created block")
+            .expect("created forwarded");
+        assert_eq!(
+            created,
+            format!("{created_block}\n\n"),
+            "an untouched record must stay a byte-for-byte passthrough"
+        );
+
+        let failed = bridge
+            .push_block(failure_block)
+            .expect("failed block")
+            .expect("failed forwarded");
+        assert!(
+            failed.contains("\"code\":\"context_length_exceeded\""),
+            "the live stream must carry the structured code Codex compacts on: {failed}"
+        );
+        assert!(
+            failed.contains("maximum context length"),
+            "the upstream wording must survive: {failed}"
+        );
     }
 
     #[test]

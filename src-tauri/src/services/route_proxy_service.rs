@@ -26,11 +26,11 @@ use crate::services::official_agent_identity_service::{
 use crate::services::platform_capability_service::PlatformCapabilityService;
 use crate::services::request_compression;
 use crate::services::response_failure_service::{
-    detect_response_failed, is_cross_resource_item_failure, is_definitive_quota_exhaustion_failure,
-    is_encrypted_content_failure, is_insufficient_permissions_failure, is_missing_reasoning_failure,
-    is_context_length_failure, is_quota_exhaustion_failure, is_text_only_chat_content_failure,
-    is_thinking_signature_failure, stream_disconnected_before_completion,
-    STREAM_DISCONNECTED_FAILURE_MESSAGE,
+    detect_response_failed, is_context_length_failure, is_cross_resource_item_failure,
+    is_definitive_quota_exhaustion_failure, is_encrypted_content_failure,
+    is_insufficient_permissions_failure, is_missing_reasoning_failure, is_quota_exhaustion_failure,
+    is_text_only_chat_content_failure, is_thinking_signature_failure,
+    stream_disconnected_before_completion, STREAM_DISCONNECTED_FAILURE_MESSAGE,
 };
 use crate::services::responses_encrypted_content::{
     sanitize_reasoning_from_bytes, sanitize_replayed_reasoning_from_bytes, ReasoningCleanupMode,
@@ -1604,9 +1604,22 @@ pub(crate) async fn forward_request(
                 )
                 .await;
                 if terminal {
-                    // Hand the upstream's own body back verbatim; a client that
-                    // asked for a stream still gets the buffered error document,
-                    // which is what a non-2xx failure is.
+                    let failure = detect_response_failed(&primed);
+                    if let Some(failure) = failure
+                        .as_ref()
+                        .filter(|failure| is_context_length_failure(failure))
+                    {
+                        // Codex only compacts on a 200 `response.failed` with a
+                        // structured code; a buffered HTTP 502 cannot trigger it.
+                        return context_length_failure_response(
+                            &platform,
+                            &path,
+                            status,
+                            upstream_headers,
+                            &primed,
+                            failure,
+                        );
+                    }
                     return proxy_upstream_response(status, upstream_headers, primed);
                 }
                 continue;
@@ -1983,11 +1996,18 @@ pub(crate) async fn forward_request(
         // the upstream's own sentence back — it names the fix ("reduce the length
         // of the messages or run compaction") and lets the client compact and
         // resend, which is the only thing that can actually recover the turn.
-        if semantic_failure
+        if let Some(failure) = semantic_failure
             .as_ref()
-            .is_some_and(is_context_length_failure)
+            .filter(|failure| is_context_length_failure(failure))
         {
-            return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
+            return context_length_failure_response(
+                &platform,
+                &path,
+                status,
+                upstream_headers,
+                &response_bytes,
+                failure,
+            );
         }
 
         // A refused `thinking` signature is not this account's doing. The block
@@ -2966,6 +2986,78 @@ fn proxy_upstream_response(
         .map_err(|error| format!("Could not build proxy response: {error}"))
 }
 
+/// Re-encode a context-window rejection into the error shape the inbound
+/// client actually speaks.
+///
+/// Codex only compacts after a **200** `response.failed` event carrying the
+/// structured `context_length_exceeded` code. Chat Completions clients have no
+/// such event type: they expect a normal OpenAI error document, and an HTTP 400
+/// is the failure their accumulators already handle. The upstream sentence is
+/// kept verbatim so the UI still names the actionable problem.
+#[allow(clippy::too_many_arguments)]
+fn context_length_failure_response(
+    platform: &str,
+    path: &str,
+    upstream_status: StatusCode,
+    upstream_headers: HeaderMap,
+    upstream_body: &[u8],
+    failure: &crate::services::response_failure_service::SemanticResponseFailure,
+) -> Result<Response, String> {
+    if is_chat_completions_path(path) {
+        let mut headers = upstream_headers;
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return proxy_upstream_response(
+            StatusCode::BAD_REQUEST,
+            headers,
+            json!({ "error": {
+                "message": failure.message,
+                "type": "invalid_request_error",
+                "param": Value::Null,
+                "code": "context_length_exceeded",
+            }})
+            .to_string()
+            .into_bytes(),
+        );
+    }
+    if platform != PlatformId::Codex.as_str() || !is_responses_path(path) {
+        // Neither Codex's compaction code nor Chat's error document applies.
+        // Hand the upstream's own answer back byte for byte.
+        return proxy_upstream_response(upstream_status, upstream_headers, upstream_body.to_vec());
+    }
+    let body = json!({
+        "type": "response.failed",
+        "sequence_number": 0,
+        "response": {
+            "id": "resp_ai_switch_context_length",
+            "object": "response",
+            "created_at": Utc::now().timestamp(),
+            "status": "failed",
+            "error": {
+                "code": "context_length_exceeded",
+                // Codex reads this to decide whether to compact; keep the
+                // upstream's own wording so the user sees the actionable text.
+                "message": failure.message,
+            },
+            "output": [],
+            "usage": Value::Null,
+        },
+    });
+    let mut headers = upstream_headers;
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    proxy_upstream_response(
+        StatusCode::OK,
+        headers,
+        format!("data: {body}\n\n").into_bytes(),
+    )
+}
+
 /// Build the client response around a streaming body.
 ///
 /// Same header handling as [`proxy_upstream_response`] — `is_hop_by_hop_header`
@@ -3276,17 +3368,15 @@ impl StreamCompletion {
         let preview = observer.preview().to_vec();
         let outcome = observer.finish();
         let truncated = outcome.disconnected_before_completion;
-        // Prefer the upstream's own failure sentence when it sent one. A gateway
-        // that rejects an oversized prompt over a 200 stream sets the disconnect
-        // flag (no terminal marker arrived), but the generic wording would hide
-        // the one sentence that names the fix and would mis-file it as a flaky
-        // account. Only a stream that failed *without* saying why keeps the
-        // generic message.
+        // Prefer the upstream's own failure sentence whenever it sent one. The
+        // context-limit classifier already narrows *when* that sentence changes
+        // retry and account-health behavior; once the upstream has spoken, the
+        // log must quote it rather than substitute generic disconnect wording
+        // for every other semantic failure.
         let error_message = truncated.then(|| {
             outcome
                 .failure
                 .as_ref()
-                .filter(|failure| is_context_length_failure(failure))
                 .map(|failure| failure.message.clone())
                 .unwrap_or_else(|| STREAM_DISCONNECTED_FAILURE_MESSAGE.to_string())
         });
@@ -6939,6 +7029,11 @@ fn tool_choice_targets_hosted(tool_choice: &Value) -> bool {
 fn is_responses_path(path: &str) -> bool {
     let normalized = path.trim().trim_end_matches('/');
     normalized.ends_with("/responses") || normalized == "responses"
+}
+
+fn is_chat_completions_path(path: &str) -> bool {
+    let normalized = normalize_request_path(path);
+    strip_leading_version_path_segments(&normalized).trim_end_matches('/') == "/chat/completions"
 }
 
 fn strip_leading_version_path_segments(path: &str) -> String {
@@ -10825,11 +10920,26 @@ mod tests {
             .await
             .expect("proxy response");
 
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
         let body = response.text().await.expect("proxy body");
         assert!(
+            body.contains("\"type\":\"response.failed\""),
+            "Codex 必须收到能识别的结构化失败事件: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"context_length_exceeded\""),
+            "只有结构化 code 才能触发后续自动压缩: {body}"
+        );
+        assert!(
             body.contains("maximum context length"),
-            "客户端必须看到上游原文，而不是聚合错误: {body}"
+            "上游可操作的原文也必须保留: {body}"
         );
         assert!(
             !body.contains("All route credentials failed"),
@@ -10849,6 +10959,196 @@ mod tests {
             assert!(account.next_retry_at.is_none());
             assert!(account.last_failure_message.is_none());
         }
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// The chat entry point has a second shape: the upstream accepts the
+    /// streaming request with a 200 and reports the context rejection as an SSE
+    /// error frame. Nothing reached the client yet, so it must still be answered
+    /// as a Chat error document instead of a Responses event.
+    #[tokio::test]
+    async fn streamed_chat_context_length_overflow_is_returned_as_a_chat_error() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_chunked_sse_upstream(
+            vec![
+                "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\",\"code\":null}}\n\n",
+            ],
+            Duration::from_millis(0),
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "chat-stream-overflow",
+            &upstream,
+            mapping,
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "stream": true,
+                "messages": [{"role":"user","content":"0"}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.expect("chat error json");
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("maximum context length")),
+            "上游可操作的原文也必须保留: {body}"
+        );
+        assert!(
+            body.get("type").is_none(),
+            "Chat 客户端不能收到 Responses 事件: {body}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "请求过大不得重试");
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert_eq!(account.transient_failure_count, 0);
+        assert!(account.last_failure_message.is_none());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// Only Codex compacts from `context_length_exceeded`; only Chat speaks the
+    /// OpenAI error document. Every other inbound protocol must keep receiving
+    /// the upstream's own bytes and status, unchanged by this rule.
+    #[tokio::test]
+    async fn a_context_rejection_on_another_protocol_is_passed_through_verbatim() {
+        const UPSTREAM_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        let failure = crate::services::response_failure_service::SemanticResponseFailure {
+            code: None,
+            error_type: Some("invalid_request_error".to_string()),
+            message: "prompt is too long: 250000 tokens > 200000 maximum".to_string(),
+        };
+
+        let response = context_length_failure_response(
+            "claude",
+            "/v1/messages",
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            UPSTREAM_BODY.as_bytes(),
+            &failure,
+        )
+        .expect("passthrough response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            UPSTREAM_BODY,
+            "other protocols must not be rewritten into a Responses or Chat error"
+        );
+    }
+
+    /// Chat Completions clients do not have Codex's compaction path, but they
+    /// still need the upstream's null-code context rejection normalized into the
+    /// standard Chat error shape. A Responses `response.failed` event here would
+    /// be unparsable to them.
+    #[tokio::test]
+    async fn chat_context_length_overflow_is_returned_as_a_chat_error() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const OVERFLOW: &str = r#"{"error":{"message":"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.","type":"server_error","param":null,"code":null}}"#;
+        let (upstream, calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::BAD_GATEWAY,
+            OVERFLOW,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let credential_id =
+            create_proxy_api_credential_with_config(&pool, "chat-overflow", &upstream, mapping)
+                .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "messages": [{"role":"user","content":"0"}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body: Value = response.json().await.expect("chat error json");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("maximum context length")),
+            "上游可操作的原文也必须保留: {body}"
+        );
+        assert!(
+            body.get("type").is_none(),
+            "Chat 客户端不能收到 Responses 事件: {body}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "请求过大不得重试");
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert_eq!(account.transient_failure_count, 0);
+        assert!(account.last_failure_message.is_none());
 
         RouteProxyService::stop(&runtime).await.expect("stop proxy");
     }
@@ -10913,7 +11213,16 @@ mod tests {
             .await
             .expect("proxy response");
 
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await.expect("proxy body");
+        assert!(
+            body.contains("\"type\":\"response.failed\""),
+            "流式请求的首帧也必须改成结构化失败事件: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"context_length_exceeded\""),
+            "结构化 code 缺失时 Codex 不会自动压缩: {body}"
+        );
         assert!(
             body.contains("maximum context length"),
             "客户端必须看到上游原文: {body}"
@@ -10993,7 +11302,21 @@ mod tests {
             .await
             .expect("proxy response");
         assert_eq!(response.status(), StatusCode::OK);
-        let _ = response.text().await.expect("proxy body");
+        let body = response.text().await.expect("proxy body");
+        // The user-visible failure is the whole point: the bridged event has to
+        // carry the code Codex compacts on, not the upstream's null.
+        assert!(
+            body.contains("\"type\":\"response.failed\""),
+            "首帧之后到达的错误也必须改写成结构化失败事件: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"context_length_exceeded\""),
+            "桥接层必须补上 Codex 能识别的结构化 code: {body}"
+        );
+        assert!(
+            body.contains("maximum context length"),
+            "改写不能丢掉上游原文: {body}"
+        );
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -11011,6 +11334,74 @@ mod tests {
             "上游已明确说明请求过大，不得记成断流: {:?}",
             account.last_failure_message
         );
+    }
+
+    /// A Responses-shaped opening frame followed by the gateway's null-code
+    /// context error in the same read is already past the prime loop. Codex
+    /// must still see the recognized structured code, not the raw error frame.
+    #[tokio::test]
+    async fn streamed_context_length_overflow_after_opening_responses_frame_is_rewritten() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_chunked_sse_upstream(
+            vec![
+                "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\ndata: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\",\"code\":null}}\n\n",
+            ],
+            Duration::from_millis(0),
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let credential_id =
+            create_proxy_api_credential_with_config(&pool, "opening-overflow", &upstream, mapping)
+                .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"0"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("proxy body");
+        assert!(
+            body.contains("\"code\":\"context_length_exceeded\""),
+            "上游 code 为 null 时也必须改写成 Codex 能识别的结构: {body}"
+        );
+        assert!(
+            body.contains("maximum context length"),
+            "改写不能丢掉上游原文: {body}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "请求过大不得重试");
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert_eq!(account.transient_failure_count, 0);
+        assert!(account.last_failure_message.is_none());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
     }
 
     /// A stream that carried data but never terminated is still charged against

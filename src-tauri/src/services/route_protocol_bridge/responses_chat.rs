@@ -7,6 +7,7 @@ use super::common::{
 };
 use super::thinking_text::{self, InlineThinkingSplitter, TextSegment};
 use super::TransformedBridgeResponse;
+use crate::services::response_failure_service::stamp_context_length_exceeded_code;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
@@ -1174,12 +1175,28 @@ fn failed_response_from_error(value: &Value) -> Value {
             .unwrap_or_else(|| chrono::Utc::now().timestamp()),
         "status": "failed",
         "error": {
-            "code": value.pointer("/error/code").cloned().unwrap_or(Value::Null),
+            "code": error_code_or_context_length(value),
             "message": message
         },
         "output": [],
         "usage": Value::Null
     })
+}
+
+/// The code Codex may classify on. A gateway that reports an oversized prompt
+/// with `code: null` is still a context-window rejection, and only the prose
+/// says so; supply the structured code the client actually keys on. Every other
+/// error keeps whatever code the upstream sent, including a missing one.
+fn error_code_or_context_length(value: &Value) -> Value {
+    let mut stamped = value.clone();
+    if stamp_context_length_exceeded_code(&mut stamped) {
+        return stamped
+            .pointer("/error/code")
+            .or_else(|| stamped.pointer("/response/error/code"))
+            .cloned()
+            .unwrap_or(Value::Null);
+    }
+    value.pointer("/error/code").cloned().unwrap_or(Value::Null)
 }
 
 fn failed_response_event(state: &ChatStreamState, value: &Value, sequence_number: u64) -> Value {
@@ -1197,7 +1214,7 @@ fn failed_response_event(state: &ChatStreamState, value: &Value, sequence_number
             "status": "failed",
             "model": state.model(),
             "error": {
-                "code": value.pointer("/error/code").cloned().unwrap_or(Value::Null),
+                "code": error_code_or_context_length(value),
                 "message": message
             },
             "output": [],
@@ -2141,6 +2158,62 @@ mod tests {
     };
     use serde_json::Value;
     use std::collections::BTreeMap;
+
+    /// The non-streaming variant of the same gateway verdict: a Chat JSON error
+    /// document with a null code still has to become a structured Responses
+    /// failure, because that is what the client's compaction path reads.
+    #[test]
+    fn a_null_code_context_rejection_in_json_gains_the_structured_code() {
+        let body = r#"{"error":{"message":"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.","type":"server_error","code":null}}"#;
+
+        let converted = chat_response_to_responses(
+            200,
+            Some("application/json"),
+            body.as_bytes(),
+            &BTreeMap::new(),
+        )
+        .expect("json conversion");
+        let value: Value = serde_json::from_slice(&converted.body).expect("responses json");
+        assert_eq!(
+            value.pointer("/error/code").and_then(Value::as_str),
+            Some("context_length_exceeded"),
+            "Codex can only compact on the structured code: {value}"
+        );
+    }
+
+    /// The live gateway rejects an oversized prompt with a null code and only a
+    /// prose message. Codex decides whether to compact from the structured code,
+    /// so the bridge has to add it while the Chat upstream is being translated
+    /// into Responses events.
+    #[test]
+    fn a_null_code_context_rejection_gains_the_structured_code() {
+        let body = concat!(
+            "data: {\"id\":\"cc-1\",\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\",\"code\":null}}\n\n"
+        );
+
+        let converted = chat_response_to_responses(
+            200,
+            Some("text/event-stream"),
+            body.as_bytes(),
+            &BTreeMap::new(),
+        )
+        .expect("sse conversion");
+        let text = String::from_utf8_lossy(&converted.body);
+        let failed: Value = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("response.failed"))
+            .expect("response.failed event");
+        assert_eq!(
+            failed
+                .pointer("/response/error/code")
+                .and_then(Value::as_str),
+            Some("context_length_exceeded"),
+            "Codex can only compact on the structured code: {failed}"
+        );
+    }
 
     /// One response must report one creation time. The streaming path used to
     /// read the clock again for the terminal event, so a stream that started

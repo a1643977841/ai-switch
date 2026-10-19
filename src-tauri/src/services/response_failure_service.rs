@@ -448,6 +448,49 @@ pub fn detect_response_failed(body: &[u8]) -> Option<SemanticResponseFailure> {
     None
 }
 
+/// Stamp the structured `context_length_exceeded` code onto a semantic failure
+/// whose upstream reported the context overflow only in prose.
+///
+/// Codex decides whether to compact from `error.code`, not from the sentence.
+/// One real gateway answers an oversized prompt with `code: null` and only the
+/// text "…maximum context length…run compaction", so every bridge that forwards
+/// its error to Codex has to supply the code the client keys on. The structured
+/// code is only added when the value is already a recognized semantic failure
+/// and the code is absent, null, or blank; an unrelated error keeps its own code
+/// and an error that already names a code is left alone.
+///
+/// Returns whether the value was changed.
+pub fn stamp_context_length_exceeded_code(value: &mut Value) -> bool {
+    let Some(failure) = detect_response_failed_value(value) else {
+        return false;
+    };
+    if failure
+        .code
+        .as_deref()
+        .is_some_and(|code| !code.trim().is_empty())
+    {
+        return false;
+    }
+    if !is_context_length_failure(&failure) {
+        return false;
+    }
+    let code = Value::String("context_length_exceeded".to_string());
+    // Three possible homes for the error object, tried in order. Chained
+    // `or_else` closures cannot borrow `value` mutably twice, so each probe is
+    // its own statement.
+    for pointer in ["/response/error", "/error", "/extError"] {
+        if let Some(error) = value.pointer_mut(pointer).and_then(Value::as_object_mut) {
+            error.insert("code".to_string(), code);
+            return true;
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert("code".to_string(), code);
+        return true;
+    }
+    false
+}
+
 pub(crate) fn detect_response_failed_value(value: &Value) -> Option<SemanticResponseFailure> {
     let failed = value.get("type").and_then(Value::as_str) == Some("response.failed")
         || value.pointer("/response/status").and_then(Value::as_str) == Some("failed")
@@ -1077,6 +1120,74 @@ data: {"error":{"code":"global_fixed_window_quota_exhausted"}}
                 "must not match: {message}"
             );
         }
+    }
+
+    /// The gateway's context rejection carries only prose and `code: null`.
+    /// Codex keys its compaction path on the structured code, so the stamping
+    /// pass has to add it — while leaving an existing code or an unrelated
+    /// failure alone.
+    #[test]
+    fn stamps_only_prose_only_context_rejections() {
+        let mut null_code = serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "code": null,
+                    "message": "Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction."
+                }
+            }
+        });
+        assert!(stamp_context_length_exceeded_code(&mut null_code));
+        assert_eq!(
+            null_code
+                .pointer("/response/error/code")
+                .and_then(Value::as_str),
+            Some("context_length_exceeded")
+        );
+
+        // An error that already names a code keeps it: the structured code is
+        // only a fallback for the prose-only wording.
+        let mut other_code = serde_json::json!({
+            "error": {
+                "code": "rate_limit_error",
+                "message": "maximum context length was mentioned"
+            }
+        });
+        assert!(!stamp_context_length_exceeded_code(&mut other_code));
+        assert_eq!(
+            other_code.pointer("/error/code").and_then(Value::as_str),
+            Some("rate_limit_error")
+        );
+
+        // An unrelated failure keeps whatever shape it had, code included.
+        let mut unrelated = serde_json::json!({
+            "type": "response.failed",
+            "response": { "status": "failed", "error": { "message": "maintenance" } }
+        });
+        assert!(!stamp_context_length_exceeded_code(&mut unrelated));
+        assert!(unrelated.pointer("/response/error/code").is_none());
+    }
+
+    /// Chat-shaped envelopes put the error at the top level; the stamp has to
+    /// land on that object, never at the document root.
+    #[test]
+    fn stamps_a_top_level_error_envelope() {
+        let mut value = serde_json::json!({
+            "error": {
+                "code": null,
+                "message": "prompt is too long: 250000 tokens > 200000 maximum"
+            }
+        });
+        assert!(stamp_context_length_exceeded_code(&mut value));
+        assert_eq!(
+            value.pointer("/error/code").and_then(Value::as_str),
+            Some("context_length_exceeded")
+        );
+        assert!(
+            value.get("code").is_none(),
+            "the code belongs on the error object: {value}"
+        );
     }
 
     #[test]
