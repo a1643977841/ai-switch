@@ -290,6 +290,62 @@ pub fn is_cross_resource_item_failure(text: &str) -> bool {
         && message.contains("use the same resource")
 }
 
+/// Returns whether an upstream rejected the request because the assembled prompt
+/// exceeds the model's context window.
+///
+/// This is a verdict on the *request*, not on the account or the model. Every
+/// credential in the pool would reject the same bytes identically, so a failover
+/// walk cannot recover the turn, a retry cannot either, and charging it to the
+/// credential parks a healthy account for a request the caller has to shrink.
+/// The gateway this was observed on reports it as an HTTP 502 with
+/// `type: server_error` — indistinguishable from a transient upstream wobble by
+/// status alone — so the message (or a structured code) is the only signal.
+///
+/// Structured codes are checked first because they are unambiguous. The prose
+/// fallback stays narrow on purpose: it needs the *context length / window*
+/// vocabulary, or the one gateway sentence about "more tokens than this model's
+/// maximum context length allows". A bare "too long" or "too large" that names
+/// the response, `max_tokens`, or a list instead of the prompt must not match,
+/// or a genuine account failure would be excused.
+pub fn is_context_length_failure(failure: &SemanticResponseFailure) -> bool {
+    let code = failure
+        .code
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ':', ' '], "");
+    if code.contains("contextlengthexceeded")
+        || code.contains("modelcontextwindowexceeded")
+        || code.contains("stringabovemaxlength")
+        || code.contains("maximumnumberoftokens")
+    {
+        return true;
+    }
+
+    let message = failure
+        .message
+        .to_ascii_lowercase()
+        .replace(['`', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // The gateway that produced the report this rule exists for.
+    if message.contains("run compaction") && message.contains("maximum context length") {
+        return true;
+    }
+    // The OpenAI / Azure structured sentence and its close paraphrases. Both
+    // the "maximum context length" and "context window" spellings are accepted,
+    // and the "prompt is too long" form Anthropic uses. Each requires a token
+    // count alongside the window so a stray mention of the phrase alone — say a
+    // help link — does not match.
+    (message.contains("maximum context length") && message.contains("token"))
+        || (message.contains("context window") && message.contains("token"))
+        || (message.contains("context length") && message.contains("exceed"))
+        || message.contains("prompt is too long")
+}
+
 /// Returns whether a Chat upstream rejected a conversation because a content
 /// part's `type` is outside its text-only allowed list.
 ///
@@ -953,6 +1009,76 @@ data: {"error":{"code":"global_fixed_window_quota_exhausted"}}
         assert!(detect_auto_pause_code(br#"{"error":{"message":"boom"}}"#).is_none());
         assert!(detect_auto_pause_code(br#"{}"#).is_none());
     }
+    /// A too-large request is a verdict on the request itself: every account
+    /// rejects the same bytes identically, so it must never be charged to a
+    /// credential or retried. The gateway words it as an HTTP 502 with
+    /// `type: server_error`, which is why the status alone classifies it as a
+    /// transient upstream wobble — the message is the only signal.
+    #[test]
+    fn context_length_failure_matches_the_real_gateway_wording() {
+        for message in [
+            "Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.",
+            "This model's maximum context length is 128000 tokens. However, your messages resulted in 140000 tokens.",
+            "Requested token count exceeds the model's maximum context length of 200000 tokens.",
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            "This model's maximum context length is 8192 tokens, however you requested 9000 tokens",
+        ] {
+            let failure = SemanticResponseFailure {
+                code: None,
+                error_type: Some("server_error".to_string()),
+                message: message.to_string(),
+            };
+            assert!(
+                is_context_length_failure(&failure),
+                "must match: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_length_failure_matches_structured_codes() {
+        for code in [
+            "context_length_exceeded",
+            "model_context_window_exceeded",
+            "string_above_max_length",
+        ] {
+            let failure = SemanticResponseFailure {
+                code: Some(code.to_string()),
+                error_type: None,
+                message: "some localized relay prose".to_string(),
+            };
+            assert!(
+                is_context_length_failure(&failure),
+                "must match code {code}"
+            );
+        }
+    }
+
+    /// The rule has to stay narrow: generic "too long" prose about anything but
+    /// the prompt (a response, an argument, a list) must not match, or a real
+    /// account failure would be excused.
+    #[test]
+    fn context_length_failure_ignores_unrelated_too_long_errors() {
+        for message in [
+            "The response took too long to generate",
+            "max_tokens is too long for this model",
+            "input array is too large",
+            "Your request contains too many items",
+            "the requested model is too long to resolve",
+            "",
+        ] {
+            let failure = SemanticResponseFailure {
+                code: Some("invalid_request_error".to_string()),
+                error_type: None,
+                message: message.to_string(),
+            };
+            assert!(
+                !is_context_length_failure(&failure),
+                "must not match: {message}"
+            );
+        }
+    }
+
     #[test]
     fn cross_resource_item_failure_matches_only_the_resource_reuse_error() {
         for message in [

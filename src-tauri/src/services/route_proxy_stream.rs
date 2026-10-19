@@ -209,6 +209,14 @@ pub struct StreamOutcome {
     /// True when data frames arrived but no terminal marker ever did — the
     /// streaming counterpart of `stream_disconnected_before_completion`.
     pub disconnected_before_completion: bool,
+    /// The upstream's own failure frame, when one arrived.
+    ///
+    /// Kept alongside the boolean flag so the bookkeeping can report what the
+    /// upstream actually said instead of the generic disconnect wording: a
+    /// gateway that rejects an oversized prompt over a 200 stream sets the
+    /// disconnect flag, but labelling that "stream disconnected" hides the one
+    /// sentence that names the fix.
+    pub failure: Option<SemanticResponseFailure>,
     /// How many frames carried reasoning text. `0` on a stream that was watched
     /// from start to finish means the upstream really did not reason — see
     /// [`StreamObserver::reasoning_deltas`].
@@ -355,6 +363,10 @@ pub struct StreamObserver {
     marker_carry: String,
     streaming_request: bool,
     semantic_failure: bool,
+    /// The first upstream failure frame's own `SemanticResponseFailure`, kept so
+    /// the request log and health bookkeeping can surface the real message. The
+    /// boolean above stays the fast "something failed" flag; this is the "what".
+    failure: Option<SemanticResponseFailure>,
     /// 确定的账号级额度/余额错误（首帧即见），结账时要单独记在实际账号上。
     quota_failure: Option<SemanticResponseFailure>,
     pending_messages: BTreeMap<String, (u64, String)>,
@@ -388,6 +400,7 @@ impl StreamObserver {
             marker_carry: String::new(),
             streaming_request,
             semantic_failure: false,
+            failure: None,
             quota_failure: None,
             pending_messages: BTreeMap::new(),
             pending_text_bytes: 0,
@@ -459,16 +472,28 @@ impl StreamObserver {
         self.quota_failure.as_ref()
     }
 
+    /// The first upstream failure frame's own parsed failure, or `None` when the
+    /// stream only ever failed by stopping without a terminal event.
+    pub fn failure(&self) -> Option<&SemanticResponseFailure> {
+        self.failure.as_ref()
+    }
+
     fn note_semantic_failure(&mut self, value: &Value) {
         if self.quota_failure.is_none() {
             self.quota_failure =
                 detect_response_failed_value(value).filter(is_definitive_quota_exhaustion_failure);
         }
-        self.semantic_failure |= matches!(
+        let is_failure = matches!(
             value["type"].as_str(),
             Some("response.failed" | "response.incomplete" | "error")
         ) || value.get("error").is_some_and(|value| !value.is_null())
             || value.pointer("/response/status").and_then(Value::as_str) == Some("failed");
+        if is_failure {
+            self.semantic_failure = true;
+            if self.failure.is_none() {
+                self.failure = detect_response_failed_value(value);
+            }
+        }
     }
 
     /// 每一条上游流各自分帧，断在 JSON 中间的尾巴不能拼到下一条流里。
@@ -562,6 +587,7 @@ impl StreamObserver {
             disconnected_before_completion: self.streaming_request
                 && self.saw_data_frame
                 && (!self.saw_terminal_marker || self.semantic_failure),
+            failure: self.failure,
             reasoning_deltas: self.reasoning_deltas,
             continuation: self.continuation,
         }

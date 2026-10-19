@@ -28,7 +28,7 @@ use crate::services::request_compression;
 use crate::services::response_failure_service::{
     detect_response_failed, is_cross_resource_item_failure, is_definitive_quota_exhaustion_failure,
     is_encrypted_content_failure, is_insufficient_permissions_failure, is_missing_reasoning_failure,
-    is_quota_exhaustion_failure, is_text_only_chat_content_failure,
+    is_context_length_failure, is_quota_exhaustion_failure, is_text_only_chat_content_failure,
     is_thinking_signature_failure, stream_disconnected_before_completion,
     STREAM_DISCONNECTED_FAILURE_MESSAGE,
 };
@@ -1571,7 +1571,7 @@ pub(crate) async fn forward_request(
                 }
             };
             if let Some((error_message, retry_delay)) = prime_failure {
-                handle_stream_prime_failure(
+                let terminal = handle_stream_prime_failure(
                     &state,
                     pool,
                     &platform,
@@ -1603,6 +1603,12 @@ pub(crate) async fn forward_request(
                     &mut retry_errors,
                 )
                 .await;
+                if terminal {
+                    // Hand the upstream's own body back verbatim; a client that
+                    // asked for a stream still gets the buffered error document,
+                    // which is what a non-2xx failure is.
+                    return proxy_upstream_response(status, upstream_headers, primed);
+                }
                 continue;
             }
             let first_chunk = axum::body::Bytes::from(primed);
@@ -1968,6 +1974,20 @@ pub(crate) async fn forward_request(
                 upstream_headers,
                 body.to_string().into_bytes(),
             );
+        }
+
+        // The assembled prompt is larger than the model's window. Every account
+        // pointed at this model rejects the same bytes identically, so walking the
+        // pool produces only the aggregated "all route credentials failed" error
+        // and parks healthy accounts for a request the caller has to shrink. Hand
+        // the upstream's own sentence back — it names the fix ("reduce the length
+        // of the messages or run compaction") and lets the client compact and
+        // resend, which is the only thing that can actually recover the turn.
+        if semantic_failure
+            .as_ref()
+            .is_some_and(is_context_length_failure)
+        {
+            return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
         }
 
         // A refused `thinking` signature is not this account's doing. The block
@@ -3035,6 +3055,12 @@ struct StreamPrimeContext<'a> {
 /// Mirrors the buffered path's transport-failure arm: log the attempt, then
 /// either queue the same account again or record the failure and let the caller
 /// fall through to the next candidate.
+///
+/// Returns `true` when the failure is terminal for the whole request — the
+/// caller must hand the buffered bytes straight back to the client instead of
+/// walking the pool. The only such case today is an oversized prompt: every
+/// account rejects the same bytes, so a walk can only burn the pool and end in
+/// the aggregated error that hides the upstream's own sentence.
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream_prime_failure(
     state: &ProxyAppState,
@@ -3052,7 +3078,7 @@ async fn handle_stream_prime_failure(
     credential_index: usize,
     credential_retry_count: usize,
     retry_errors: &mut Vec<String>,
-) {
+) -> bool {
     let metadata = route_proxy_request_metadata(
         context.attempt,
         platform,
@@ -3098,6 +3124,18 @@ async fn handle_stream_prime_failure(
         context.response_body,
         None,
     );
+    // An oversized prompt is terminal for the whole request: every account
+    // rejects the same bytes, so walking the pool would burn it down to an
+    // aggregated error that hides the upstream's own sentence. Hand the buffered
+    // bytes straight back, leaving every credential untouched.
+    if context
+        .response_body
+        .and_then(detect_response_failed)
+        .as_ref()
+        .is_some_and(is_context_length_failure)
+    {
+        return true;
+    }
     if let Some(failure) = context
         .response_body
         .and_then(detect_response_failed)
@@ -3117,7 +3155,7 @@ async fn handle_stream_prime_failure(
             retry_queue.clear();
         }
         retry_errors.push(error_message.to_string());
-        return;
+        return false;
     }
     if retry_same_credential {
         match retry_delay {
@@ -3140,6 +3178,7 @@ async fn handle_stream_prime_failure(
         retry_errors.push(error_message.to_string());
         stop_failover_when_disabled(retry_queue, failure_policy.failover_enabled);
     }
+    false
 }
 
 /// Everything needed to close the books on a streamed response.
@@ -3237,7 +3276,20 @@ impl StreamCompletion {
         let preview = observer.preview().to_vec();
         let outcome = observer.finish();
         let truncated = outcome.disconnected_before_completion;
-        let error_message = truncated.then(|| STREAM_DISCONNECTED_FAILURE_MESSAGE.to_string());
+        // Prefer the upstream's own failure sentence when it sent one. A gateway
+        // that rejects an oversized prompt over a 200 stream sets the disconnect
+        // flag (no terminal marker arrived), but the generic wording would hide
+        // the one sentence that names the fix and would mis-file it as a flaky
+        // account. Only a stream that failed *without* saying why keeps the
+        // generic message.
+        let error_message = truncated.then(|| {
+            outcome
+                .failure
+                .as_ref()
+                .filter(|failure| is_context_length_failure(failure))
+                .map(|failure| failure.message.clone())
+                .unwrap_or_else(|| STREAM_DISCONNECTED_FAILURE_MESSAGE.to_string())
+        });
 
         let mut usage = outcome.usage;
         let priced_model = outcome
@@ -3301,21 +3353,31 @@ impl StreamCompletion {
         }
 
         if truncated {
-            // The bytes are already with the client, so this cannot become a
-            // retry. Recording it still matters: the account's backoff and
-            // health state are what stop the pool from picking a chronically
-            // truncating upstream first next time.
-            record_route_credential_failure(
-                &state.activity,
-                &platform,
-                &state.pool,
-                &credential,
-                model_key.as_deref(),
-                "semantic_response_transient",
-                STREAM_DISCONNECTED_FAILURE_MESSAGE,
-                Some(&preview),
-            )
-            .await;
+            // 请求过大不是账号的问题：同一池里的每个账号都会以同样方式拒绝同一批
+            // 字节，记成账号故障只会把一个健康账号冷却掉，而真正的修复是缩请求。
+            // 日志已经保留了上游原文（见 `error_message`），不再给账号记失败。
+            //
+            // 真正的断流（上游没说明原因）照旧记账：账号的退避与健康状态正是用来
+            // 阻止号池优先挑一个老是断流的上游。
+            let context_overflow = outcome
+                .failure
+                .as_ref()
+                .is_some_and(is_context_length_failure);
+            if !context_overflow {
+                record_route_credential_failure(
+                    &state.activity,
+                    &platform,
+                    &state.pool,
+                    &credential,
+                    model_key.as_deref(),
+                    "semantic_response_transient",
+                    error_message
+                        .as_deref()
+                        .unwrap_or(STREAM_DISCONNECTED_FAILURE_MESSAGE),
+                    Some(&preview),
+                )
+                .await;
+            }
             return;
         }
 
@@ -10707,6 +10769,248 @@ mod tests {
         );
 
         RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A buffered (non-streaming) "request too large" reply must be returned to
+    /// the client verbatim, without retrying and without charging any account:
+    /// every pool member would reject the same bytes, so a walk can only produce
+    /// the aggregated "all route credentials failed" error and cool down healthy
+    /// accounts. Verbatim from a live gateway (HTTP 502).
+    #[tokio::test]
+    async fn context_length_overflow_is_returned_without_retrying_or_penalizing() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const OVERFLOW: &str = r#"{"error":{"message":"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.","type":"server_error","param":null,"code":null}}"#;
+        let (upstream, calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::BAD_GATEWAY,
+            OVERFLOW,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let overflow =
+            create_proxy_api_credential_with_config(&pool, "overflow", &upstream, mapping.clone())
+                .await;
+        let backup =
+            create_proxy_api_credential_with_config(&pool, "overflow-backup", &upstream, mapping)
+                .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[overflow.clone(), backup.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"0"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.text().await.expect("proxy body");
+        assert!(
+            body.contains("maximum context length"),
+            "客户端必须看到上游原文，而不是聚合错误: {body}"
+        );
+        assert!(
+            !body.contains("All route credentials failed"),
+            "不得把请求过大当成账号失败: {body}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "请求过大重试多少次都不会变好，只能打上游一次"
+        );
+        for credential_id in [overflow, backup] {
+            let account = RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("account");
+            assert_eq!(account.status, "ok");
+            assert_eq!(account.transient_failure_count, 0);
+            assert!(account.next_retry_at.is_none());
+            assert!(account.last_failure_message.is_none());
+        }
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A streamed "request too large" reply whose error frame arrives in the
+    /// opening read. The prime loop is still inside the retry window, so this is
+    /// where a failover walk would burn the whole pool on a request none of them
+    /// can serve. It must instead surface the upstream's own message once.
+    #[tokio::test]
+    async fn streamed_context_length_overflow_in_the_opening_frame_is_returned_once() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        // One read: the opening role frame followed by the gateway's error frame —
+        // the shape captured in the live request log.
+        let (upstream, calls) = start_scripted_sse_upstream(vec![vec![
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n",
+        ]])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let overflow = create_proxy_api_credential_with_config(
+            &pool,
+            "stream-overflow",
+            &upstream,
+            mapping.clone(),
+        )
+        .await;
+        let backup = create_proxy_api_credential_with_config(
+            &pool,
+            "stream-overflow-backup",
+            &upstream,
+            mapping,
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[overflow.clone(), backup.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"0"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        let body = response.text().await.expect("proxy body");
+        assert!(
+            body.contains("maximum context length"),
+            "客户端必须看到上游原文: {body}"
+        );
+        assert!(
+            !body.contains("All route credentials failed"),
+            "不得把请求过大当成账号失败: {body}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "首帧即请求过大，重试多少次都不会变好"
+        );
+        for credential_id in [overflow, backup] {
+            let account = RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("account");
+            assert_eq!(account.status, "ok");
+            assert_eq!(account.transient_failure_count, 0);
+            assert!(account.next_retry_at.is_none());
+            assert!(account.last_failure_message.is_none());
+        }
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A streamed "request too large" reply whose error frame arrives *after* the
+    /// first frame already reached the client. The bytes are gone, so this cannot
+    /// become a retry — but it must not be booked as an account-harming
+    /// `stream disconnected`: the upstream said exactly what was wrong, and that
+    /// message has to survive into the request log.
+    #[tokio::test]
+    async fn streamed_context_length_overflow_after_output_is_not_charged_as_a_disconnect() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_chunked_sse_upstream(
+            vec![
+                "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\"}}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            Duration::from_millis(20),
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let credential_id =
+            create_proxy_api_credential_with_config(&pool, "late-overflow", &upstream, mapping)
+                .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"0"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.text().await.expect("proxy body");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "已经下发的字节无法重放，请求过大也不该再打同一个账号"
+        );
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert!(
+            !account
+                .last_failure_message
+                .as_deref()
+                .is_some_and(|message| message.contains("stream disconnected")),
+            "上游已明确说明请求过大，不得记成断流: {:?}",
+            account.last_failure_message
+        );
     }
 
     /// A stream that carried data but never terminated is still charged against
