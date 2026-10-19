@@ -39,24 +39,26 @@ pub fn static_dir_candidates_report() -> String {
     lines.join("\n")
 }
 
-fn candidate_static_dirs() -> Vec<PathBuf> {
+fn candidate_static_dirs_from(exe_dir: Option<&Path>, cwd: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(exe_dir) = current_exe.parent() {
-            candidates.extend([
-                exe_dir.join("web"),
-                exe_dir.join("dist"),
-                exe_dir.join("resources").join("web"),
-                exe_dir.join("_up_").join("web"),
-                exe_dir.join("..").join("web"),
-                exe_dir.join("..").join("dist"),
-                exe_dir.join("..").join("..").join("dist"),
-            ]);
-        }
+    if let Some(exe_dir) = exe_dir {
+        candidates.extend([
+            exe_dir.join("web"),
+            exe_dir.join("dist"),
+            exe_dir.join("resources").join("web"),
+            exe_dir.join("_up_").join("web"),
+            exe_dir.join("..").join("web"),
+            exe_dir.join("..").join("dist"),
+            exe_dir.join("..").join("..").join("dist"),
+            // macOS `.app` layout: the executable lives in
+            // `Contents/MacOS/`, while Tauri copies the `web/` resource to
+            // `Contents/Resources/`.
+            exe_dir.join("..").join("Resources").join("web"),
+        ]);
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Some(cwd) = cwd {
         candidates.extend([
             cwd.join("web"),
             cwd.join("dist"),
@@ -66,6 +68,14 @@ fn candidate_static_dirs() -> Vec<PathBuf> {
     }
 
     candidates
+}
+
+fn candidate_static_dirs() -> Vec<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let cwd = std::env::current_dir().ok();
+    candidate_static_dirs_from(exe_dir.as_deref(), cwd.as_deref())
 }
 
 fn has_index(path: &Path) -> bool {
@@ -155,6 +165,20 @@ mod tests {
         assert!(resolve_static_file(&web, "/index.html")
             .unwrap()
             .ends_with("index.html"));
+    }
+
+    #[test]
+    fn finds_web_assets_in_macos_app_resources() {
+        let bundle = tempdir().unwrap();
+        let exe_dir = bundle.path().join("Contents").join("MacOS");
+        let web = bundle.path().join("Contents").join("Resources").join("web");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::create_dir_all(&web).unwrap();
+        fs::write(web.join("index.html"), "<html></html>").unwrap();
+
+        let candidates = candidate_static_dirs_from(Some(&exe_dir), None);
+
+        assert!(candidates.iter().any(|candidate| has_index(candidate)));
     }
 
     #[test]
