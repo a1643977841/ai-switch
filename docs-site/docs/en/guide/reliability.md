@@ -146,8 +146,9 @@ This channel also clears `transient_failure_count`, `next_retry_at`, and `cooldo
 
 Quota exhaustion is recognised two ways:
 
-1. **By error code or error text** — the normalized `error.code` contains `insufficientquota` / `quotaexhausted` / `usageexhausted`, or the message carries a fixed phrase such as `额度已耗尽`, `配额耗尽`, `quota exhausted`, or `insufficient quota`.
+1. **By error code or error text** — the normalized `error.code` contains `insufficientquota` / `quotaexhausted` / `usageexhausted`, or the message carries a fixed phrase such as `额度已耗尽`, `配额耗尽`, `quota exhausted`, `insufficient quota`, or `Insufficient Balance`.
 2. **By `error.type` plus the start of the message** — `error.type` is `new_api_error` (case-insensitive) **and** the message begins with `用户额度不足` ("insufficient user balance").
+3. **By the start of the message alone** — the message begins with `Insufficient Balance` (case-insensitive). A relay in front of a prepaid account stamps its own envelope on top (`code: invalid_request_error`, `type: unknown_error`) and appends its own `request_id`, so no field names the cause — only the opening phrase does. The same words mid-sentence describe a different account and are deliberately excluded.
 
 The second rule exists for new-api style gateways. Their spent-balance response looks like this, and commonly arrives with a 401 / 403 status:
 

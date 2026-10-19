@@ -1,6 +1,9 @@
 use super::*;
 
 const QUOTA_ERROR: &str = r#"{"error":{"message":"user quota is not enough (request id: test-quota)","type":"new_api_error","param":"","code":"insufficient_user_quota"}}"#;
+/// A relay in front of a prepaid account: the envelope is its own generic one,
+/// so only the message prefix names the cause.
+const BALANCE_ERROR: &str = r#"{"error":{"code":"invalid_request_error","message":"Insufficient Balance (request_id: 8634272f-3a00-46f4-8a0a-d526a83c2c00)","param":null,"type":"unknown_error"}}"#;
 const HEALTHY: &str = r#"{"id":"healthy","object":"response","output":[]}"#;
 
 struct Upstream {
@@ -325,4 +328,137 @@ async fn new_api_user_quota_followed_by_done_is_not_synthesized_as_success() {
     assert!(body.contains("insufficient_user_quota"));
     assert!(!body.contains("response.completed"), "[DONE] 不能把额度错误变成成功: {body}");
     assert_exhausted(&pool, &ids[1]).await;
+}
+
+async fn assert_balance_exhausted(pool: &SqlitePool, id: &str) {
+    let account = RouteCredentialRepository::get(pool, id).await.unwrap();
+    assert_eq!(
+        account.status, "error",
+        "明确余额不足应立即异常，不能受普通重试/错误阈值开关影响"
+    );
+    assert_eq!(
+        account.last_failure_kind.as_deref(),
+        Some("semantic_response_failed")
+    );
+    assert!(
+        account
+            .last_failure_message
+            .unwrap_or_default()
+            .contains("Insufficient Balance")
+    );
+    assert!(account.next_retry_at.is_none());
+}
+
+#[tokio::test]
+async fn insufficient_balance_marks_error_and_switches_once_in_aggregate_mode() {
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::OK,
+    ] {
+        let quota = upstream(status, vec![BALANCE_ERROR.into()], false).await;
+        let good = upstream(StatusCode::OK, vec![HEALTHY.into()], false).await;
+        let (pool, state, ids) = setup(&[&quota, &good], PoolModelMode::Aggregate).await;
+        let (status, body) = request(state, false, "gpt-6-astra").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("healthy"));
+        assert_eq!(quota.calls.load(Ordering::SeqCst), 1, "不能用完同账号重试预算才换账号");
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert_balance_exhausted(&pool, &ids[0]).await;
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &ids[1])
+                .await
+                .unwrap()
+                .status,
+            "ok"
+        );
+    }
+}
+
+#[tokio::test]
+async fn insufficient_balance_without_another_account_stops_after_one_call() {
+    let quota = upstream(
+        StatusCode::BAD_REQUEST,
+        vec![BALANCE_ERROR.into()],
+        false,
+    )
+    .await;
+    let (pool, state, ids) = setup(&[&quota], PoolModelMode::Aggregate).await;
+    let (status, _) = request(state, false, "gpt-6-astra").await;
+    assert!(!status.is_success());
+    assert_eq!(quota.calls.load(Ordering::SeqCst), 1);
+    assert_balance_exhausted(&pool, &ids[0]).await;
+}
+
+#[tokio::test]
+async fn insufficient_balance_precise_mode_does_not_use_another_account() {
+    for model in ["account-0/gpt-6-astra", "gpt-6-astra"] {
+        let quota = upstream(
+            StatusCode::BAD_REQUEST,
+            vec![BALANCE_ERROR.into()],
+            false,
+        )
+        .await;
+        let good = upstream(StatusCode::OK, vec![HEALTHY.into()], false).await;
+        let (pool, state, ids) = setup(&[&quota, &good], PoolModelMode::Precise).await;
+        let (status, _) = request(state, false, model).await;
+        assert!(!status.is_success());
+        assert_eq!(quota.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(good.calls.load(Ordering::SeqCst), 0, "精确模式不能跨账号");
+        assert_balance_exhausted(&pool, &ids[0]).await;
+    }
+}
+
+#[tokio::test]
+async fn insufficient_balance_in_a_stream_opening_skips_same_account_retries() {
+    for body in [BALANCE_ERROR.to_string(), format!("data: {BALANCE_ERROR}\n\n")] {
+        let quota = upstream(StatusCode::OK, vec![body], true).await;
+        let good = upstream(StatusCode::OK,vec![
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"healthy\",\"status\":\"completed\"}}\n\n".into()
+        ],true).await;
+        let (pool, state, ids) = setup(&[&quota, &good], PoolModelMode::Aggregate).await;
+        let (_, body) = request(state, true, "gpt-6-astra").await;
+        assert!(body.contains("healthy"), "{body}");
+        assert!(!body.contains("Insufficient Balance"));
+        assert_eq!(
+            quota.calls.load(Ordering::SeqCst),
+            1,
+            "首帧余额不足不得反复打同一账号"
+        );
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert_balance_exhausted(&pool, &ids[0]).await;
+    }
+}
+
+#[tokio::test]
+async fn insufficient_balance_during_continuation_skips_the_exhausted_account() {
+    for (status, body, sse) in [
+        (StatusCode::BAD_REQUEST, BALANCE_ERROR.to_string(), false),
+        (StatusCode::OK, BALANCE_ERROR.to_string(), false),
+        (StatusCode::OK, format!("data: {BALANCE_ERROR}\n\n"), true),
+    ] {
+        let first = upstream(StatusCode::OK, text_stream("root", "前半句", false), true).await;
+        let quota = upstream(status, vec![body], sse).await;
+        let good = upstream(StatusCode::OK, text_stream("healthy", "后半句", true), true).await;
+        let (pool, state, ids) = setup(&[&first, &quota, &good], PoolModelMode::Aggregate).await;
+        let (_, body) = request(state, true, "gpt-6-astra").await;
+        assert!(
+            body.contains("前半句") && body.contains("后半句"),
+            "续写应跳过无额度账号: {body}"
+        );
+        assert!(!body.contains("Insufficient Balance"));
+        assert_eq!(first.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(quota.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert_balance_exhausted(&pool, &ids[1]).await;
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &ids[0])
+                .await
+                .unwrap()
+                .status,
+            "ok",
+            "不能把续写账号的余额错误记在原始账号上"
+        );
+    }
 }

@@ -26,11 +26,11 @@ use crate::services::official_agent_identity_service::{
 use crate::services::platform_capability_service::PlatformCapabilityService;
 use crate::services::request_compression;
 use crate::services::response_failure_service::{
-    detect_response_failed, is_cross_resource_item_failure, is_encrypted_content_failure,
-    is_insufficient_permissions_failure, is_missing_reasoning_failure, is_quota_exhaustion_failure,
-    is_new_api_user_quota_failure,
-    is_text_only_chat_content_failure, is_thinking_signature_failure,
-    stream_disconnected_before_completion, STREAM_DISCONNECTED_FAILURE_MESSAGE,
+    detect_response_failed, is_cross_resource_item_failure, is_definitive_quota_exhaustion_failure,
+    is_encrypted_content_failure, is_insufficient_permissions_failure, is_missing_reasoning_failure,
+    is_quota_exhaustion_failure, is_text_only_chat_content_failure,
+    is_thinking_signature_failure, stream_disconnected_before_completion,
+    STREAM_DISCONNECTED_FAILURE_MESSAGE,
 };
 use crate::services::responses_encrypted_content::{
     sanitize_reasoning_from_bytes, sanitize_replayed_reasoning_from_bytes, ReasoningCleanupMode,
@@ -1530,7 +1530,9 @@ pub(crate) async fn forward_request(
                             // the observer judge how the stream ends.
                             break None;
                         }
-                        if let Some(failure) = detect_response_failed(&primed).filter(is_new_api_user_quota_failure) {
+                        if let Some(failure) = detect_response_failed(&primed)
+                            .filter(is_definitive_quota_exhaustion_failure)
+                        {
                             break Some((format!("{}: {}", credential.display_name, failure.message), None));
                         }
                         if !sse_payload_started(&primed) {
@@ -2046,8 +2048,14 @@ pub(crate) async fn forward_request(
         }
 
         if quota_failure || quota_exhausted {
-            if let Some(failure) = semantic_failure.as_ref().filter(|failure| is_new_api_user_quota_failure(failure)) {
-                record_new_api_user_quota_failure(state, &platform, &credential,
+            // A spent balance is as deterministic as a revoked key: settle the
+            // account on the first occurrence, and only walk to another account
+            // when the pool runs in aggregate mode.
+            if let Some(failure) = semantic_failure
+                .as_ref()
+                .filter(|failure| is_definitive_quota_exhaustion_failure(failure))
+            {
+                record_definitive_quota_failure(state, &platform, &credential,
                     Some(status.as_u16()), &failure.message, Some(&response_bytes)).await;
                 if !quota_failover_allowed(state, &platform).await {
                     return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
@@ -3093,9 +3101,9 @@ async fn handle_stream_prime_failure(
     if let Some(failure) = context
         .response_body
         .and_then(detect_response_failed)
-        .filter(is_new_api_user_quota_failure)
+        .filter(is_definitive_quota_exhaustion_failure)
     {
-        record_new_api_user_quota_failure(
+        record_definitive_quota_failure(
             state,
             platform,
             credential,
@@ -3621,11 +3629,11 @@ impl StreamPump {
         let Some(completion) = self.guard.completion.as_mut() else {
             return;
         };
-        let Some(failure) = completion.observer.new_api_user_quota_failure().cloned() else {
+        let Some(failure) = completion.observer.quota_failure().cloned() else {
             return;
         };
         let body = json!({"error":{"message":failure.message,"type":failure.error_type,"code":failure.code}}).to_string();
-        record_new_api_user_quota_failure(
+        record_definitive_quota_failure(
             &completion.state,
             &completion.platform,
             &self.current_credential,
@@ -3649,11 +3657,12 @@ impl StreamPump {
         status: u16,
         body: &[u8],
     ) -> bool {
-        let Some(failure) = detect_response_failed(body).filter(is_new_api_user_quota_failure)
+        let Some(failure) =
+            detect_response_failed(body).filter(is_definitive_quota_exhaustion_failure)
         else {
             return false;
         };
-        record_new_api_user_quota_failure(
+        record_definitive_quota_failure(
             state,
             platform,
             credential,
@@ -3904,7 +3913,7 @@ impl StreamPump {
                         prefix.extend_from_slice(&chunk);
                         if detect_response_failed(&prefix)
                             .as_ref()
-                            .is_some_and(is_new_api_user_quota_failure)
+                            .is_some_and(is_definitive_quota_exhaustion_failure)
                         {
                             rejected.insert(credential.id.clone());
                             if self
@@ -4469,7 +4478,8 @@ async fn quota_failover_allowed(state: &ProxyAppState, platform: &str) -> bool {
     )
 }
 
-async fn record_new_api_user_quota_failure(
+/// 确定的账号级额度/余额错误：立即异常，不受普通失败阈值与「错误自动异常」开关影响。
+async fn record_definitive_quota_failure(
     state: &ProxyAppState,
     platform: &str,
     credential: &SelectedCredential,

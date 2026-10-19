@@ -26,6 +26,14 @@ pub fn is_transient_response_failure(message: &str) -> bool {
 const NEW_API_ERROR_TYPE: &str = "new_api_error";
 /// How those gateways open the message once the account's balance is spent.
 const NEW_API_INSUFFICIENT_BALANCE_PREFIX: &str = "用户额度不足";
+/// How a relay in front of a prepaid account opens the message once that
+/// account is out of money.
+///
+/// Unlike the new-api rule there is nothing to key on besides the phrase: the
+/// relay stamps its own generic envelope on top (`code: invalid_request_error`,
+/// `type: unknown_error`) and appends its own `request_id`, so neither field
+/// names the cause. The opener is all that is left.
+const INSUFFICIENT_BALANCE_MESSAGE_PREFIX: &str = "insufficient balance";
 
 /// new-api 自己返回的账号额度耗尽码。必须同时匹配 type/code，不能仅凭英文消息误伤其它错误。
 pub(crate) fn is_new_api_user_quota_failure(failure: &SemanticResponseFailure) -> bool {
@@ -58,11 +66,40 @@ fn is_new_api_insufficient_balance(failure: &SemanticResponseFailure) -> bool {
             .starts_with(NEW_API_INSUFFICIENT_BALANCE_PREFIX)
 }
 
+/// Returns whether an upstream reported that the account behind the credential
+/// is out of money, e.g.
+/// `Insufficient Balance (request_id: 8634272f-…)`.
+///
+/// The rest of the sentence is the relay's own bookkeeping (request id,
+/// remaining balance), so the rule is anchored on the opener exactly like the
+/// new-api one above. Anchoring matters in both directions: the same words
+/// quoted in the middle of a longer sentence describe some *other* account's
+/// balance — a relay relaying a relay — and must not settle this one.
+fn is_insufficient_balance_failure(failure: &SemanticResponseFailure) -> bool {
+    failure
+        .message
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with(INSUFFICIENT_BALANCE_MESSAGE_PREFIX)
+}
+
+/// Returns whether a quota failure settles the account on its own: the balance
+/// behind the credential is provably spent, so the account is marked abnormal
+/// on the first occurrence instead of after the configured failure threshold,
+/// and no retry budget is spent on it.
+///
+/// The proxy's quota branch uses this to choose between the immediate path and
+/// the threshold-gated one; the stream observer uses the same rule to spot the
+/// error in a frame that already went out.
+pub fn is_definitive_quota_exhaustion_failure(failure: &SemanticResponseFailure) -> bool {
+    is_new_api_user_quota_failure(failure) || is_insufficient_balance_failure(failure)
+}
+
 /// Returns whether an upstream error is a definitive quota exhaustion signal.
 /// These errors should mark the account as abnormal immediately instead of
 /// spending the configured retry budget.
 pub fn is_quota_exhaustion_failure(failure: &SemanticResponseFailure) -> bool {
-    if is_new_api_user_quota_failure(failure) || is_new_api_insufficient_balance(failure) {
+    if is_definitive_quota_exhaustion_failure(failure) || is_new_api_insufficient_balance(failure) {
         return true;
     }
 
@@ -341,6 +378,7 @@ pub fn detect_response_failed(body: &[u8]) -> Option<SemanticResponseFailure> {
         || lower.contains("our servers are currently overloaded")
         || lower.contains("insufficient_quota")
         || lower.contains("quota exhausted")
+        || lower.starts_with(INSUFFICIENT_BALANCE_MESSAGE_PREFIX)
         || normalized.contains("额度已耗尽")
         || normalized.contains("额度耗尽")
         || normalized.contains("配额已耗尽");
@@ -558,6 +596,57 @@ data: {"type":"response.failed","error":{"message":"down"}}
         let failure = detect_response_failed(
             r#"{"error":{"type":"new_api_error","message":"用户额度不足, 剩余额度: ＄-0.398052 (request id: 202609020218166141364498268d9d6A3V7Qkt0)"},"type":"error"}"#
                 .as_bytes(),
+        )
+        .expect("semantic failure");
+        assert!(is_quota_exhaustion_failure(&failure));
+    }
+
+    /// A relay in front of a prepaid account stamps its own envelope on the
+    /// balance error, so only the opening phrase names the cause.
+    #[test]
+    fn treats_an_insufficient_balance_message_as_quota_exhaustion() {
+        for body in [
+            r#"{"error":{"code":"invalid_request_error","message":"Insufficient Balance (request_id: 8634272f-3a00-46f4-8a0a-d526a83c2c00)","param":null,"type":"unknown_error"}}"#,
+            r#"{"error":{"message":"insufficient balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}"#,
+        ] {
+            let failure = detect_response_failed(body.as_bytes()).expect("semantic failure");
+            assert!(
+                is_quota_exhaustion_failure(&failure),
+                "must be account balance: {body}"
+            );
+            assert!(
+                is_definitive_quota_exhaustion_failure(&failure),
+                "must settle the account on the first occurrence: {body}"
+            );
+        }
+    }
+
+    /// The phrase has to open the message: the same words mid-sentence describe
+    /// an account this request was never routed to.
+    #[test]
+    fn insufficient_balance_rule_requires_the_message_prefix() {
+        let relayed = SemanticResponseFailure {
+            code: None,
+            error_type: None,
+            message: "upstream channel error: Insufficient Balance on channel 3".to_string(),
+        };
+        assert!(!is_definitive_quota_exhaustion_failure(&relayed));
+        assert!(!is_quota_exhaustion_failure(&relayed));
+
+        let unrelated = SemanticResponseFailure {
+            code: None,
+            error_type: None,
+            message: "insufficient permissions for this operation".to_string(),
+        };
+        assert!(!is_definitive_quota_exhaustion_failure(&unrelated));
+    }
+
+    /// A relay that answers in plain text instead of JSON still has to reach the
+    /// same verdict.
+    #[test]
+    fn treats_a_plain_text_insufficient_balance_as_quota_exhaustion() {
+        let failure = detect_response_failed(
+            b"Insufficient Balance (request_id: 8634272f-3a00-46f4-8a0a-d526a83c2c00)",
         )
         .expect("semantic failure");
         assert!(is_quota_exhaustion_failure(&failure));

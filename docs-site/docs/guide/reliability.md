@@ -146,8 +146,9 @@ pub enum ProxyFailureKind {
 
 识别配额耗尽有两种依据：
 
-1. **错误码或错误文本**——`error.code` 归一化后含 `insufficientquota` / `quotaexhausted` / `usageexhausted`，或消息里出现 `额度已耗尽`、`配额耗尽`、`quota exhausted`、`insufficient quota` 等固定说法。
+1. **错误码或错误文本**——`error.code` 归一化后含 `insufficientquota` / `quotaexhausted` / `usageexhausted`，或消息里出现 `额度已耗尽`、`配额耗尽`、`quota exhausted`、`insufficient quota`、`Insufficient Balance` 等固定说法。
 2. **`error.type` 加消息开头**——`error.type` 为 `new_api_error`（大小写不敏感）**且**消息以 `用户额度不足` 开头。
+3. **消息开头**——消息以 `Insufficient Balance` 开头（大小写不敏感）。代理在付费账号前套了自有信封（`code: invalid_request_error`、`type: unknown_error`）并附上自己的 `request_id`，没有任何字段能标识原因，只能靠这个开头短语识别：同一句话出现在句子中间描述的是别的账号，不在此列。
 
 第二条是为 new-api 系中转站单独加的。它们的余额耗尽响应长这样，常带 401 / 403 状态码：
 
