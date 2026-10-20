@@ -25,6 +25,7 @@ use crate::services::official_agent_identity_service::{
     resolve_agent_identity_headers, CODEX_CHATGPT_BACKEND_BASE_URL,
 };
 use crate::services::platform_capability_service::PlatformCapabilityService;
+use crate::services::request_content_rejection;
 use crate::services::request_compression;
 use crate::services::response_failure_service::{
     detect_response_failed, is_content_rejection, is_context_length_failure,
@@ -1182,8 +1183,29 @@ pub(crate) async fn forward_request(
     // Set once the missing-reasoning self-heal has rewritten this request, so a
     // still-failing upstream falls through to normal failover instead of looping.
     let mut reasoning_forced = false;
+    let mut trimmed_content_rejection_retry = false;
 
-    while let Some((credential_index, credential_retry_count)) = retry_queue.pop_front() {
+    loop {
+        let Some((credential_index, credential_retry_count)) = retry_queue.pop_front() else {
+            if trimmed_content_rejection_retry || rejected_indexes.is_empty() {
+                break;
+            }
+            let retry_indexes = content_rejection_retry_indexes(&credentials, &rejected_indexes);
+            if retry_indexes.is_empty() {
+                break;
+            }
+            let Some(next_body) = request_content_rejection::elide_old_tool_outputs(&body_bytes)
+            else {
+                break;
+            };
+            body_bytes = axum::body::Bytes::from(next_body);
+            trimmed_content_rejection_retry = true;
+            retry_queue = retry_indexes
+                .into_iter()
+                .map(|credential_index| (credential_index, 0usize))
+                .collect();
+            continue;
+        };
         attempt += 1;
         let selected = &credentials[credential_index];
         // The upstream model this account was matched on. Every failure recorded
@@ -2338,6 +2360,24 @@ pub(crate) async fn forward_request(
         "All route credentials failed for {platform}: {}",
         retry_errors.join(" | ")
     ))
+}
+
+fn content_rejection_retry_indexes(
+    credentials: &[SelectedCredential],
+    rejected_indexes: &[usize],
+) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    rejected_indexes
+        .iter()
+        .copied()
+        .filter(|index| *index < credentials.len())
+        .filter(|index| seen.insert(*index))
+        .filter(|index| {
+            parse_json_object(&credentials[*index].config_json, "config")
+                .ok()
+                .is_some_and(|config| request_content_rejection::trim_enabled(&config))
+        })
+        .collect()
 }
 
 fn map_to_reqwest_headers(headers: &HeaderMap) -> reqwest::header::HeaderMap {
@@ -19934,6 +19974,233 @@ data: [DONE]\n\n";
             account.last_failure_kind.as_deref(),
             Some("content_rejected")
         );
+    }
+
+    fn b1_chat_body(model: &str) -> Value {
+        json!({
+            "model": model,
+            "messages": (0..7).map(|index| {
+                json!({
+                    "role": "tool",
+                    "tool_call_id": format!("call-{index}"),
+                    "content": b1_old_tool_output(index)
+                })
+            }).collect::<Vec<_>>()
+        })
+    }
+
+    fn b1_old_tool_output(index: usize) -> String {
+        format!("tool-output-{index}-{}", "x".repeat(160))
+    }
+
+    async fn proxy_b1(pool: &SqlitePool, model: &str) -> Response {
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            pool,
+            "codex",
+            "sk-ai-switch-test-b1",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+        proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/chat/completions".parse().unwrap(),
+            Body::from(b1_chat_body(model).to_string()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn content_rejection_compat_retries_only_the_enabled_rejected_account() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"sensitive words detected"}}"#;
+        let (enabled, enabled_calls) = start_status_sequence_upstream(
+            1,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SENSITIVE,
+            r#"{"ok":"trimmed"}"#,
+        )
+        .await;
+        let (disabled, disabled_calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SENSITIVE,
+            r#"{"ok":"never"}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let enabled_id = create_proxy_api_credential_with_config(
+            &pool,
+            "enabled",
+            &enabled,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0}
+            }),
+        )
+        .await;
+        let disabled_id = create_proxy_api_credential_with_config(
+            &pool,
+            "disabled",
+            &disabled,
+            json!({"failure_policy":{"retry_count":0,"retry_interval_ms":0}}),
+        )
+        .await;
+        sqlx::query("UPDATE route_credentials SET route_priority = 1 WHERE id = ?")
+            .bind(&enabled_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE route_credentials SET route_priority = 2 WHERE id = ?")
+            .bind(&disabled_id).execute(&pool).await.unwrap();
+        RoutePoolRepository::replace_members(&pool, "codex", &[enabled_id.clone(), disabled_id])
+            .await.unwrap();
+        let response = proxy_b1(&pool, "gpt-5.5").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+            r#"{"ok":"trimmed"}"#
+        );
+        assert_eq!(enabled_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(disabled_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_disabled_never_tries_a_fresh_account_but_b1_retries_the_rejected_one() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"content-blocked","message":"blocked"}}"#;
+        let (first, first_calls) = start_status_sequence_upstream(
+            1, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":"b1"}"#,
+        ).await;
+        let (backup, backup_calls) = start_status_sequence_upstream(
+            0, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":"backup"}"#,
+        ).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first_id = create_proxy_api_credential_with_config(
+            &pool, "first", &first,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0,"failover_enabled":false}
+            }),
+        ).await;
+        let backup_id = create_proxy_api_credential_with_config(
+            &pool, "backup", &backup,
+            json!({"failure_policy":{"retry_count":0,"retry_interval_ms":0}}),
+        ).await;
+        sqlx::query("UPDATE route_credentials SET route_priority = 1 WHERE id = ?")
+            .bind(&first_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE route_credentials SET route_priority = 2 WHERE id = ?")
+            .bind(&backup_id).execute(&pool).await.unwrap();
+        RoutePoolRepository::replace_members(&pool, "codex", &[first_id, backup_id]).await.unwrap();
+        let response = proxy_b1(&pool, "gpt-5.5").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn precise_mode_b1_stays_on_the_pinned_account() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"blocked"}}"#;
+        let (pinned, pinned_calls) = start_status_sequence_upstream(
+            1, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":"pinned"}"#,
+        ).await;
+        let (other, other_calls) = start_status_sequence_upstream(
+            0, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":"other"}"#,
+        ).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let pinned_id = create_proxy_api_credential_with_config(
+            &pool, "A", &pinned,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0}
+            }),
+        ).await;
+        let other_id = create_proxy_api_credential_with_config(
+            &pool, "B", &other,
+            json!({"failure_policy":{"retry_count":0,"retry_interval_ms":0}}),
+        ).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[pinned_id, other_id]).await.unwrap();
+        let response = proxy_b1(&pool, "A/gpt-5.5").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(pinned_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(other_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn content_rejection_without_a_trimmable_body_returns_the_pool_error() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"blocked"}}"#;
+        let (upstream, _calls) = start_status_sequence_upstream(
+            usize::MAX, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":true}"#,
+        ).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool, "short", &upstream,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0}
+            }),
+        ).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[id]).await.unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool, "codex", "sk-ai-switch-test-short",
+        ).await.unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap());
+        let response = proxy_handler(
+            AxumState(state), Method::POST, headers,
+            "/v1/chat/completions".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}).to_string()),
+        ).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("All route credentials failed"), "{body}");
+        assert!(body.contains("blocked"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn b1_runs_at_most_once_when_the_trimmed_request_is_rejected_again() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"blocked"}}"#;
+        let (upstream, calls) = start_status_sequence_upstream(
+            usize::MAX, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":true}"#,
+        ).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool, "still rejected", &upstream,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0}
+            }),
+        ).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[id]).await.unwrap();
+        let response = proxy_b1(&pool, "gpt-5.5").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one original plus one trimmed attempt");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("blocked"));
     }
 
     /// 重试预算用尽之后是否走池里的下一个账号，由失败账号自己的
