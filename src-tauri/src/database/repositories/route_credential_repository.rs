@@ -1789,6 +1789,108 @@ impl RouteCredentialRepository {
         })
     }
 
+    /// Record an explicit content-policy rejection for the account tooltip
+    /// without charging it as an account-health failure. A cooling account
+    /// keeps the failure that caused the cooldown: replacing it would hide the
+    /// more actionable problem while the older rejection is still in force.
+    pub async fn record_content_rejection(
+        pool: &SqlitePool,
+        id: &str,
+        message: &str,
+        response_body: Option<&[u8]>,
+    ) -> Result<(), AppError> {
+        let mut tx = pool.begin().await.map_err(|err| {
+            database_error(
+                "database.route_credential_content_rejection_tx",
+                "Could not start content rejection update",
+                err,
+            )
+        })?;
+        let state = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT cooldown_until, next_retry_at FROM route_credentials WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| {
+            database_error(
+                "database.route_credential_content_rejection_read",
+                "Could not read content rejection state",
+                err,
+            )
+        })?;
+        let Some((cooldown_until, next_retry_at)) = state else {
+            return Err(AppError::Validation {
+                code: "validation.route_credential_not_found",
+                message: "Route credential does not exist".to_string(),
+                details: Some(id.to_string()),
+                recoverable: true,
+            });
+        };
+
+        let now = Utc::now();
+        let still_failing = [cooldown_until.as_deref(), next_retry_at.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|raw| {
+                chrono::DateTime::parse_from_rfc3339(raw)
+                    .map(|deadline| deadline.with_timezone(&Utc) > now)
+                    // A malformed deadline is unknown state; preserve the
+                    // existing failure rather than overwrite something we
+                    // cannot interpret.
+                    .unwrap_or(true)
+            });
+        if still_failing {
+            tx.commit().await.map_err(|err| {
+                database_error(
+                    "database.route_credential_content_rejection_commit",
+                    "Could not finish content rejection check",
+                    err,
+                )
+            })?;
+            return Ok(());
+        }
+
+        let now = now.to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE route_credentials
+             SET last_failure_kind = 'content_rejected',
+                 last_failure_message = ?,
+                 last_failure_response_json = ?,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(truncate_failure_message(message))
+        .bind(truncate_failure_response(response_body))
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| {
+            database_error(
+                "database.route_credential_content_rejection_update",
+                "Could not record content rejection",
+                err,
+            )
+        })?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::Validation {
+                code: "validation.route_credential_not_found",
+                message: "Route credential does not exist".to_string(),
+                details: Some(id.to_string()),
+                recoverable: true,
+            });
+        }
+        tx.commit().await.map_err(|err| {
+            database_error(
+                "database.route_credential_content_rejection_commit",
+                "Could not save content rejection",
+                err,
+            )
+        })?;
+        Ok(())
+    }
+
     /// A success clears this account's backoff and, when the request named a
     /// model, that model's row. Sibling models keep their own state: proving
     /// `glm-5.3` works says nothing about `gpt-5.6-sol`.
@@ -4467,6 +4569,126 @@ mod tests {
         assert!(stored.next_retry_at.is_none());
         assert!(stored.cooldown_until.is_none());
         assert_eq!(stored.transient_failure_count, 3);
+    }
+
+    #[tokio::test]
+    async fn content_rejection_records_only_last_failure_fields() {
+        let pool = crate::database::create_memory_pool().await.unwrap();
+        crate::database::run_migrations(&pool).await.unwrap();
+        let created = create_api_credential(&pool, "codex", "Content hint").await;
+
+        sqlx::query(
+            "UPDATE route_credentials
+             SET transient_failure_count = 4,
+                 semantic_failure_streak_count = 7,
+                 semantic_failure_streak_fingerprint = 'keep-me'
+             WHERE id = ?",
+        )
+        .bind(&created.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        RouteCredentialRepository::record_content_rejection(
+            &pool,
+            &created.id,
+            "sensitive words detected (request id: test)",
+            Some(br#"{"error":{"code":"sensitive_words_detected"}}"#),
+        )
+        .await
+        .expect("record content rejection");
+
+        let stored = RouteCredentialRepository::get(&pool, &created.id)
+            .await
+            .expect("row");
+        assert_eq!(stored.status, "ok");
+        assert_eq!(stored.transient_failure_count, 4);
+        assert!(stored.next_retry_at.is_none());
+        assert!(stored.cooldown_until.is_none());
+        assert_eq!(
+            stored.last_failure_kind.as_deref(),
+            Some("content_rejected")
+        );
+        assert_eq!(
+            stored.last_failure_message.as_deref(),
+            Some("sensitive words detected (request id: test)")
+        );
+        assert_eq!(
+            stored.last_failure_response_json.as_deref(),
+            Some(r#"{"error":{"code":"sensitive_words_detected"}}"#)
+        );
+
+        let streak: (i64, Option<String>) = sqlx::query_as(
+            "SELECT semantic_failure_streak_count, semantic_failure_streak_fingerprint
+             FROM route_credentials WHERE id = ?",
+        )
+        .bind(&created.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(streak, (7, Some("keep-me".to_string())));
+    }
+
+    #[tokio::test]
+    async fn content_rejection_does_not_overwrite_an_active_failure() {
+        let pool = crate::database::create_memory_pool().await.unwrap();
+        crate::database::run_migrations(&pool).await.unwrap();
+        let created = create_api_credential(&pool, "codex", "Cooling").await;
+        let future = "2099-01-01T00:00:00+00:00";
+        sqlx::query(
+            "UPDATE route_credentials
+             SET transient_failure_count = 2, next_retry_at = ?, cooldown_until = ?,
+                 last_failure_kind = 'transport', last_failure_message = 'connection reset',
+                 last_failure_response_json = '{\"error\":\"keep\"}'
+             WHERE id = ?",
+        )
+        .bind(future)
+        .bind(future)
+        .bind(&created.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        RouteCredentialRepository::record_content_rejection(
+            &pool,
+            &created.id,
+            "sensitive words detected",
+            Some(br#"{"error":{"code":"sensitive_words_detected"}}"#),
+        )
+        .await
+        .expect("preserve active failure");
+
+        let stored = RouteCredentialRepository::get(&pool, &created.id)
+            .await
+            .expect("row");
+        assert_eq!(stored.cooldown_until.as_deref(), Some(future));
+        assert_eq!(stored.last_failure_kind.as_deref(), Some("transport"));
+        assert_eq!(
+            stored.last_failure_message.as_deref(),
+            Some("connection reset")
+        );
+    }
+
+    #[tokio::test]
+    async fn content_rejection_on_a_missing_account_is_a_validation_error() {
+        let pool = crate::database::create_memory_pool().await.unwrap();
+        crate::database::run_migrations(&pool).await.unwrap();
+
+        let error = RouteCredentialRepository::record_content_rejection(
+            &pool,
+            "missing",
+            "sensitive words detected",
+            None,
+        )
+        .await
+        .expect_err("missing account");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "validation.route_credential_not_found",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
