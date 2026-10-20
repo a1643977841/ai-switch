@@ -2808,6 +2808,89 @@ describe("AccountsScreen", () => {
     expect(within(secondRow).queryByText(/关键词检测/)).not.toBeInTheDocument();
   });
 
+  it("writes content rejection compatibility when creating an API account", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "新增账号" }));
+    await userEvent.click(screen.getByRole("button", { name: "API 账号" }));
+    await userEvent.type(screen.getByLabelText("API 账号名称"), "Compat API");
+    await userEvent.type(screen.getByLabelText("API Key"), "sk-compat");
+    await openFormTab("高级");
+    await userEvent.click(screen.getByLabelText("内容过滤兼容"));
+    await userEvent.click(screen.getByRole("button", { name: "保存账号" }));
+
+    await waitFor(() =>
+      expect(createApiRouteCredential).toHaveBeenCalledWith(
+        expect.objectContaining({
+          display_name: "Compat API",
+          content_rejection_compat: "trim_old_tool_outputs",
+        }),
+      ),
+    );
+  });
+
+  it("removes content rejection compatibility from config when edited off", async () => {
+    const api = {
+      ...credentialsFixture[1],
+      platform: "codex" as const,
+      display_name: "Compat Edit",
+      config_json: JSON.stringify({
+        base_url: "https://api.upstream.test/v1",
+        interface_format: "openai",
+        model_mappings: [],
+        content_rejection_compat: "trim_old_tool_outputs",
+      }),
+    };
+    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
+    vi.mocked(updateRouteCredential).mockResolvedValue(api);
+
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Compat Edit" }));
+    await openFormTab("高级");
+    const toggle = screen.getByLabelText("内容过滤兼容");
+    expect(toggle).toBeChecked();
+    await userEvent.click(toggle);
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
+    expect(config.content_rejection_compat).toBeUndefined();
+  });
+
+  it("labels content rejection and explains content-blocked with the B1 state", async () => {
+    vi.mocked(listRouteCredentials).mockResolvedValue([
+      {
+        ...credentialsFixture[1],
+        id: "cred-b1-on",
+        display_name: "B1 Enabled",
+        status: "error",
+        last_failure_kind: "content_rejected",
+        last_failure_message: "content-blocked",
+        last_failure_response_json:
+          '{"error":{"code":"content-blocked","message":"blocked by edge"}}',
+        config_json: JSON.stringify({ content_rejection_compat: "trim_old_tool_outputs" }),
+      },
+      {
+        ...credentialsFixture[0],
+        id: "cred-b1-off",
+        display_name: "B1 Disabled",
+        status: "error",
+        last_failure_kind: "content_rejected",
+        last_failure_message: "sensitive_words_detected",
+        last_failure_response_json:
+          '{"error":{"code":"sensitive_words_detected","message":"blocked"}}',
+      },
+    ]);
+
+    renderScreen();
+
+    const firstRow = await screen.findByLabelText("放置在 B1 Enabled 前");
+    const secondRow = screen.getByLabelText("放置在 B1 Disabled 前");
+    expect(within(firstRow).getByText("失败类型：内容被上游过滤")).toBeInTheDocument();
+    expect(within(firstRow).getByText(/已尝试省略旧工具输出后重试/)).toBeInTheDocument();
+    expect(within(secondRow).getByText(/可在账号编辑中开启「内容过滤兼容」/)).toBeInTheDocument();
+  });
+
   it("explains that an exhausted budget pool is the relay's, not the user's own quota", async () => {
     vi.mocked(listRouteCredentials).mockResolvedValue([
       {

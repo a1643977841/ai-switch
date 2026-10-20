@@ -1299,6 +1299,44 @@ function forceReasoningContentFromConfig(config: Record<string, unknown>): boole
   return config.force_reasoning_content === true;
 }
 
+function contentRejectionCompatFromConfig(config: Record<string, unknown>): boolean {
+  return config.content_rejection_compat === "trim_old_tool_outputs";
+}
+
+function writeContentRejectionCompat(config: Record<string, unknown>, enabled: boolean) {
+  if (enabled) {
+    config.content_rejection_compat = "trim_old_tool_outputs";
+  } else {
+    delete config.content_rejection_compat;
+  }
+}
+
+function ContentRejectionCompatOption({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (enabled: boolean) => void;
+}) {
+  return (
+    <label className="flex items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] font-medium text-stone-700">
+      <input
+        aria-label="内容过滤兼容"
+        checked={checked}
+        className="mt-0.5"
+        onChange={(event) => onChange(event.target.checked)}
+        type="checkbox"
+      />
+      <span className="grid gap-1">
+        <span>内容过滤兼容</span>
+        <span className="text-[11px] font-medium text-stone-500">
+          上游因敏感词拒绝请求时，省略较旧的工具输出并重试一次。只影响发往该上游的请求，不改本地会话记录。默认关闭；请求压缩不能绕过内容过滤。
+        </span>
+      </span>
+    </label>
+  );
+}
+
 function ResponsesEncryptedContentCleanupOption({
   checked,
   onChange,
@@ -1681,6 +1719,7 @@ function apiConfigJsonWithFields(
   forceReasoningContent = false,
   plaintextReasoningMode: ResponsesPlaintextReasoningMode = plaintextReasoningModeFromConfig(parseJsonObject(configJson)),
   requestCompressionMode: RequestCompressionMode = requestCompressionModeFromConfig(parseJsonObject(configJson)),
+  contentRejectionCompat = false,
 ) {
   const config = parseJsonObject(configJson);
   config.base_url = baseUrl.trim();
@@ -1689,6 +1728,7 @@ function apiConfigJsonWithFields(
   config.responses_custom_tool_compat = responsesCustomToolCompat;
   writePlaintextReasoningMode(config, plaintextReasoningMode);
   writeRequestCompressionMode(config, requestCompressionMode);
+  writeContentRejectionCompat(config, contentRejectionCompat);
   config.responses_encrypted_content_cleanup = responsesEncryptedContentCleanup;
   // Subordinate to the main switch: never persist an aggressive opt-in on its
   // own, so turning cleanup off cannot leave a live stripping flag behind.
@@ -2634,6 +2674,7 @@ function prettyJsonOrText(value: string) {
 }
 
 const SENSITIVE_WORDS_ERROR_CODE = "sensitive_words_detected";
+const CONTENT_REJECTION_ERROR_CODES = ["sensitive_words_detected", "content-blocked"];
 /**
  * How a relay opens `error.message` once the **shared** budget pool behind the
  * account runs dry. Worth calling out because the wording reads like a personal
@@ -2683,6 +2724,18 @@ function CredentialFailureTooltip({
   const sensitiveWords = [response, credential.last_failure_message].some((value) =>
     value?.includes(SENSITIVE_WORDS_ERROR_CODE),
   );
+  const contentRejectionCompatEnabled = contentRejectionCompatFromConfig(
+    parseJsonObject(credential.config_json),
+  );
+  const contentRejectionCompatHint = contentRejectionCompatEnabled
+    ? "该账号已开启内容过滤兼容：ai-switch 已尝试省略旧工具输出后重试。"
+    : "可在账号编辑中开启「内容过滤兼容」。";
+  const contentRejectedByCode = [response, credential.last_failure_message].some((value) => {
+    const text = value?.toLowerCase();
+    return CONTENT_REJECTION_ERROR_CODES.some((code) => text?.includes(code));
+  });
+  const contentRejected =
+    credential.last_failure_kind === "content_rejected" || contentRejectedByCode;
   const budgetPoolExhausted = [response, credential.last_failure_message].some((value) =>
     value?.toLowerCase().includes(BUDGET_POOL_EXHAUSTED_MESSAGE),
   );
@@ -2704,7 +2757,9 @@ function CredentialFailureTooltip({
       >
         <span className="block max-h-80 w-[min(36rem,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] select-text overflow-auto whitespace-normal break-words rounded-lg border border-stone-700 bg-stone-900 px-3 py-2 text-left text-[11px] font-medium leading-5 text-white shadow-xl">
           <span className="block text-stone-300">
-            失败类型：{credential.last_failure_kind?.trim() || "未知"}
+            失败类型：{contentRejected
+              ? "内容被上游过滤"
+              : credential.last_failure_kind?.trim() || "未知"}
           </span>
           {credential.last_failure_message?.trim() ? (
             <span className="mt-1 block break-words">
@@ -2717,6 +2772,14 @@ function CredentialFailureTooltip({
               data-testid={`credential-sensitive-words-hint-${credential.id}`}
             >
               友情提醒：当前中转站似乎对项目存在关键词检测，您的项目可能存在敏感词，也不排除是中转站误判。
+            </span>
+          ) : null}
+          {contentRejected ? (
+            <span
+              className="mt-1 block"
+              data-testid={`credential-content-rejection-compat-${credential.id}`}
+            >
+              {contentRejectionCompatHint}
             </span>
           ) : null}
           {budgetPoolExhausted ? (
@@ -3259,6 +3322,7 @@ export function AccountsScreen({
   const [apiResponsesEncryptedContentCleanup, setApiResponsesEncryptedContentCleanup] = useState(false);
   const [apiPlaintextReasoningMode, setApiPlaintextReasoningMode] = useState<ResponsesPlaintextReasoningMode>("auto");
   const [apiRequestCompressionMode, setApiRequestCompressionMode] = useState<RequestCompressionMode>("auto");
+  const [apiContentRejectionCompat, setApiContentRejectionCompat] = useState(false);
   const [apiResponsesEncryptedContentAggressiveStrip, setApiResponsesEncryptedContentAggressiveStrip] = useState(false);
   const [apiUserAgent, setApiUserAgent] = useState("");
   const [apiKeyField, setApiKeyField] = useState<AnthropicApiKeyField>(() =>
@@ -3314,6 +3378,7 @@ export function AccountsScreen({
   const [editResponsesEncryptedContentCleanup, setEditResponsesEncryptedContentCleanup] = useState(false);
   const [editPlaintextReasoningMode, setEditPlaintextReasoningMode] = useState<ResponsesPlaintextReasoningMode>("auto");
   const [editRequestCompressionMode, setEditRequestCompressionMode] = useState<RequestCompressionMode>("auto");
+  const [editContentRejectionCompat, setEditContentRejectionCompat] = useState(false);
   const [editResponsesEncryptedContentAggressiveStrip, setEditResponsesEncryptedContentAggressiveStrip] = useState(false);
   const [editInlineRemoteImages, setEditInlineRemoteImages] = useState(false);
   const [editTurnReminder, setEditTurnReminder] = useState(false);
@@ -3957,6 +4022,7 @@ export function AccountsScreen({
     setApiForceReasoningContent(false);
     setApiPlaintextReasoningMode("auto");
     setApiRequestCompressionMode("auto");
+    setApiContentRejectionCompat(false);
     setApiResponsesEncryptedContentCleanup(false);
     setApiResponsesEncryptedContentAggressiveStrip(false);
     setApiUserAgent("");
@@ -4022,6 +4088,7 @@ export function AccountsScreen({
       setEditForceReasoningContent(forceReasoningContentFromConfig(config));
       setEditPlaintextReasoningMode(plaintextReasoningModeFromConfig(config));
       setEditRequestCompressionMode(requestCompressionModeFromConfig(config));
+      setEditContentRejectionCompat(contentRejectionCompatFromConfig(config));
       setEditResponsesEncryptedContentCleanup(config.responses_encrypted_content_cleanup === true);
       setEditResponsesEncryptedContentAggressiveStrip(
         config.responses_encrypted_content_aggressive_strip === true,
@@ -4043,6 +4110,7 @@ export function AccountsScreen({
       setEditForceReasoningContent(false);
       setEditPlaintextReasoningMode("auto");
       setEditRequestCompressionMode("auto");
+      setEditContentRejectionCompat(false);
       setEditResponsesEncryptedContentCleanup(false);
       setEditResponsesEncryptedContentAggressiveStrip(false);
       setEditInlineRemoteImages(false);
@@ -4532,6 +4600,9 @@ export function AccountsScreen({
           ...(apiForceReasoningContent ? { force_reasoning_content: true } : {}),
           ...(apiPlaintextReasoningMode !== "auto" ? { responses_plaintext_reasoning_compat: apiPlaintextReasoningMode } : {}),
           ...(apiRequestCompressionMode !== "auto" ? { request_brotli_compression: apiRequestCompressionMode } : {}),
+          ...(apiContentRejectionCompat
+            ? { content_rejection_compat: "trim_old_tool_outputs" as const }
+            : {}),
           ...(apiResponsesEncryptedContentCleanup ? { responses_encrypted_content_cleanup: true } : {}),
           ...(apiResponsesEncryptedContentCleanup && apiResponsesEncryptedContentAggressiveStrip
             ? { responses_encrypted_content_aggressive_strip: true }
@@ -5257,6 +5328,7 @@ export function AccountsScreen({
                 editForceReasoningContent,
                 editPlaintextReasoningMode,
                 editRequestCompressionMode,
+                editContentRejectionCompat,
               ),
             )
           : writeUserAgentToConfig(
@@ -9234,6 +9306,10 @@ export function AccountsScreen({
                       value={apiUserAgent}
                     />
                     <RequestCompressionOption mode={apiRequestCompressionMode} baseUrl={apiBaseUrl} onChange={setApiRequestCompressionMode} />
+                    <ContentRejectionCompatOption
+                      checked={apiContentRejectionCompat}
+                      onChange={setApiContentRejectionCompat}
+                    />
                     <RelayBalanceFields
                       allowCustom={false}
                       fieldClass={fieldClass}
@@ -10139,6 +10215,10 @@ export function AccountsScreen({
               {editTab === "advanced" && editingCredential.kind === "api" ? (
                 <>
                   <RequestCompressionOption mode={editRequestCompressionMode} baseUrl={editApiBaseUrl} onChange={setEditRequestCompressionMode} />
+                  <ContentRejectionCompatOption
+                    checked={editContentRejectionCompat}
+                    onChange={setEditContentRejectionCompat}
+                  />
                   {shouldShowResponsesCustomToolCompatForFormat(activePlatform, editApiInterfaceFormat) ? (
                     <label className="flex items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] font-medium text-stone-700">
                       <input
