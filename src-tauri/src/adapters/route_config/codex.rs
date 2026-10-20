@@ -108,16 +108,47 @@ fn apply_managed_config(
 ) -> Result<(), AppError> {
     document["model_provider"] = value("ai-switch");
     document["model_catalog_json"] = value(CODEX_MODEL_CATALOG_FILENAME);
-    document["model_reasoning_effort"] = value("high");
-    let existing_model = document
+    // Resolve both values before touching the document: `existing_model` borrows
+    // it, and the writes below need it mutably.
+    let selected_model = document
         .get("model")
         .and_then(Item::as_str)
         .map(str::trim)
-        .filter(|model| !model.is_empty());
-    let selected_model = existing_model
+        .filter(|model| !model.is_empty())
         .filter(|model| input.client_models.iter().any(|item| item.id == *model))
-        .or_else(|| input.client_models.first().map(|item| item.id.as_str()));
+        .or_else(|| {
+            input
+                .client_models
+                .first()
+                .map(|item| item.id.as_str())
+        })
+        .map(str::to_string);
+    let selected_levels = selected_model
+        .as_deref()
+        .and_then(|model| {
+            input
+                .client_models
+                .iter()
+                .find(|item| item.id == model)
+        })
+        .map(|item| item.reasoning_levels.clone());
     if let Some(model) = selected_model {
+        // The root-level effort is what the client starts on. Writing a fixed
+        // `high` here silently overrode every model whose declared ladder tops out
+        // higher: the catalog says `default_reasoning_level = "max"` and the user
+        // ticked `max` in the account editor, but the client opened on `high`
+        // because this key outranks it. Take the selected model's own top tier
+        // instead, which is the same rule the catalog uses to pick its default.
+        if let Some(levels) = selected_levels {
+            match levels.last() {
+                Some(top) => document["model_reasoning_effort"] = value(top),
+                // A model with no tiers cannot express an effort; leaving a stale
+                // value behind would send one the client cannot honour.
+                None => {
+                    document.remove("model_reasoning_effort");
+                }
+            }
+        }
         document["model"] = value(model);
     }
     if document.get("model_providers").is_none() {

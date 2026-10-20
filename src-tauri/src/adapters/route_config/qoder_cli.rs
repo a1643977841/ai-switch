@@ -6,12 +6,60 @@ use crate::{error::AppError, models::platform::PlatformId};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
+/// Qoder ships as two independent products with separate accounts, separate
+/// gateways and — the part that matters here — separate config directories.
+///
+/// The international build (`@qoder-ai/qodercli`) reads `~/.qoder/settings.json`;
+/// the China build (`@qodercn-ai/qoderclicn`) reads `~/.qoder-cn/settings.json`.
+/// Both bundles are built from one source tree: the CLI switches on a single
+/// `isCn` flag for the directory (`.qoder-cn` vs `.qoder`), the environment
+/// prefix (`QODERCN_` vs `QODER_`) and the binary name (`qodercn` vs `qoder`).
+/// Their credentials do not overlap either — the CN build talks to
+/// `gateway.qoder.com.cn` and signs in with an Alibaba Cloud account, the
+/// international one talks to `api3.qoder.sh`.
+///
+/// Writing the international path for a CN user is therefore not a near miss:
+/// the file is never read, and the picker shows nothing. Hence two clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QoderFlavor {
+    Global,
+    China,
+}
+
+impl QoderFlavor {
+    /// Config directory name directly under the home directory.
+    const fn config_dir(self) -> &'static str {
+        match self {
+            Self::Global => ".qoder",
+            Self::China => ".qoder-cn",
+        }
+    }
+
+    const fn client_key(self) -> &'static str {
+        match self {
+            Self::Global => "qoder_cli",
+            Self::China => "qoder_cn_cli",
+        }
+    }
+
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::Global => "Qoder CLI",
+            Self::China => "Qoder CN CLI",
+        }
+    }
+}
+
 /// Qoder CLI's undocumented `providers` settings key.
 ///
-/// Verified against `@qoder-ai/qodercli` 1.1.28. This is the only Qoder surface
-/// that can reach a local proxy: the CLI calls `POST {baseUrl}/chat/completions`
-/// itself, client-side. The documented BYOK key (`modelConfigs.customModels`) is
-/// the opposite — it ships the endpoint to Alibaba's servers inside a protobuf
+/// Verified against `@qoder-ai/qodercli` 1.1.28 and `@qodercn-ai/qoderclicn`
+/// 1.1.75. Both bundles carry the same `providers` validator, the same
+/// `openai-compatible` → `custom-openai` protocol table and the same
+/// `get_external_providers_access` gate, so one renderer serves both — only the
+/// directory differs. This is the only Qoder surface that can reach a local
+/// proxy: the CLI calls `POST {baseUrl}/chat/completions` itself, client-side.
+/// The documented BYOK key (`modelConfigs.customModels`) is the opposite — it
+/// ships the endpoint to Alibaba's servers inside a protobuf
 /// `CustomModelConfig`, so a loopback URL there is unreachable by construction.
 ///
 /// Two runtime gates remain outside our control and are surfaced to the user
@@ -22,6 +70,7 @@ use std::path::{Path, PathBuf};
 pub(super) struct QoderCliAdapter {
     target_key: &'static str,
     platform: PlatformId,
+    flavor: QoderFlavor,
     /// Record key for the provider entry. Doubles as the managed marker: the
     /// validator drops a provider outright when it carries an unrecognized key,
     /// so unlike the other adapters this one cannot embed an `aiSwitch` object.
@@ -36,6 +85,7 @@ impl QoderCliAdapter {
         Self {
             target_key: "qoder_cli_codex",
             platform: PlatformId::Codex,
+            flavor: QoderFlavor::Global,
             provider_id: "ai-switch-codex",
             display_name: "AI Switch (Codex)",
         }
@@ -45,6 +95,27 @@ impl QoderCliAdapter {
         Self {
             target_key: "qoder_cli_claude",
             platform: PlatformId::Claude,
+            flavor: QoderFlavor::Global,
+            provider_id: "ai-switch-claude",
+            display_name: "AI Switch (Claude)",
+        }
+    }
+
+    pub(super) const fn cn_codex() -> Self {
+        Self {
+            target_key: "qoder_cn_cli_codex",
+            platform: PlatformId::Codex,
+            flavor: QoderFlavor::China,
+            provider_id: "ai-switch-codex",
+            display_name: "AI Switch (Codex)",
+        }
+    }
+
+    pub(super) const fn cn_claude() -> Self {
+        Self {
+            target_key: "qoder_cn_cli_claude",
+            platform: PlatformId::Claude,
+            flavor: QoderFlavor::China,
             provider_id: "ai-switch-claude",
             display_name: "AI Switch (Claude)",
         }
@@ -106,16 +177,66 @@ impl QoderCliAdapter {
     /// Per-model records. The limits belong here and only here: the validator
     /// rejects `contextWindow` / `maxOutputTokens` at the provider level, and
     /// rejects `maxTokens` inside these entries.
+    ///
+    /// Reasoning tiers go under `capabilities.thinking`. The validator forbids a
+    /// `thinking` key on the *model record itself* (`UBA` on the provider flags
+    /// it, and `NBA` — which adds `maxTokens` — flags it on each model), but
+    /// `capabilities.thinking` is the documented shape it parses and keeps. Both
+    /// lists are closed enums:
+    ///   * `modes` ∈ `["enabled", "adaptive"]` — how thinking may be switched on.
+    ///   * `supportedEffortLevels` ∈ `["none","low","medium","high","xhigh","max"]`.
+    ///
+    /// Only models whose ladder is non-empty get the block. Qoder derives the
+    /// picker's effort list from `supportedEffortLevels`, so an absent block
+    /// means "no tier control", which is the correct reading for a model that
+    /// declares none.
     fn model_entries(&self, models: &[ClientModel]) -> Vec<Value> {
         models
             .iter()
             .map(|model| {
+                let mut capabilities = serde_json::Map::new();
+                capabilities.insert("tools".to_string(), Value::Bool(true));
+                capabilities.insert(
+                    "vision".to_string(),
+                    Value::Bool(model.supports_image_input),
+                );
+                // The client's own effort enum, minus `none`: that one is the
+                // "thinking off" position Qoder appends when a ladder omits it,
+                // and advertising it as a peer of the real tiers reads as a
+                // sixth, empty tier. Deduped here rather than trusting the
+                // caller: `supportedEffortLevels` is a set to the client, and a
+                // repeated entry would show twice in the picker.
+                let mut seen = std::collections::HashSet::new();
+                let efforts = model
+                    .reasoning_levels
+                    .iter()
+                    .map(|level| level.trim().to_ascii_lowercase())
+                    .filter(|level| {
+                        level != "none"
+                            && QODER_EFFORT_LEVELS.contains(&level.as_str())
+                            && seen.insert(level.clone())
+                    })
+                    .collect::<Vec<_>>();
+                if !efforts.is_empty() {
+                    capabilities.insert(
+                        "thinking".to_string(),
+                        json!({
+                            // `enabled` is the plain on/off mode. `adaptive` lets
+                            // the model decide, which Qoder surfaces as a separate
+                            // choice rather than a tier — declared so the model can
+                            // still use it, but the picker's effort list is what
+                            // the account actually ticked.
+                            "modes": ["enabled", "adaptive"],
+                            "supportedEffortLevels": efforts,
+                        }),
+                    );
+                }
                 json!({
                     "model": model.id,
                     "displayName": format!("{} {}", self.display_name, model.id),
                     "contextWindow": model.context_window,
                     "maxOutputTokens": model.max_output_tokens,
-                    "capabilities": { "tools": true, "vision": model.supports_image_input },
+                    "capabilities": capabilities,
                 })
             })
             .collect()
@@ -128,11 +249,11 @@ impl TargetAdapter for QoderCliAdapter {
     }
 
     fn client_key(&self) -> &'static str {
-        "qoder_cli"
+        self.flavor.client_key()
     }
 
     fn client_display_name(&self) -> &'static str {
-        "Qoder CLI"
+        self.flavor.display_name()
     }
 
     fn native(&self) -> bool {
@@ -153,7 +274,8 @@ impl TargetAdapter for QoderCliAdapter {
     }
 
     fn resolve_path(&self, home: &Path) -> PathBuf {
-        home.join(".qoder").join("settings.json")
+        home.join(self.flavor.config_dir())
+            .join("settings.json")
     }
 
     fn render(
@@ -269,6 +391,13 @@ impl TargetAdapter for QoderCliAdapter {
 /// Keys the validator refuses at the provider level. Present so an adopted
 /// hand-made entry cannot keep a value that would make Qoder discard the whole
 /// provider with `[external-providers] Invalid provider configuration`.
+///
+/// `thinking` / `reasoning` are here because the provider record has no such
+/// field — but they are *not* banned outright: reasoning tiers belong under each
+/// model's `capabilities.thinking`, which [`QoderCliAdapter::model_entries`]
+/// writes. The same list also guards the model records themselves (with
+/// `maxTokens` added), so this only ever strips a key that would have been
+/// rejected anyway.
 const PROVIDER_FORBIDDEN_KEYS: &[&str] = &[
     "contextWindow",
     "maxOutputTokens",
@@ -283,6 +412,20 @@ const PROVIDER_FORBIDDEN_KEYS: &[&str] = &[
     "preserveThinking",
     "generation",
 ];
+
+/// The closed effort enum Qoder accepts in `capabilities.thinking.
+/// supportedEffortLevels` — the CLI's own `AK` array, minus `none`.
+///
+/// `none` is deliberately excluded. Qoder appends it itself when a ladder does
+/// not list it (`GT`: `[...efforts, "none"]`), so declaring it would duplicate
+/// the entry the client already synthesises and add an empty sixth tier to a
+/// five-tier model.
+///
+/// Anything outside this list must not be advertised: the CLI throws while
+/// building the request when the effort it is about to send is missing from
+/// `supportedEffortLevels`, so a stray value would turn every turn into an error
+/// rather than degrading to a coarser tier.
+const QODER_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 #[cfg(test)]
 mod tests {
@@ -311,6 +454,14 @@ mod tests {
         }
     }
 
+    /// A single-model input carrying an explicit effort ladder.
+    fn input_with_levels(model: &str, levels: &[&str]) -> RouteConfigInput {
+        let mut built = input(&[model]);
+        built.client_models[0].reasoning_levels =
+            levels.iter().map(|level| (*level).to_string()).collect();
+        built
+    }
+
     fn codex_adapter() -> std::sync::Arc<dyn TargetAdapter> {
         TargetAdapterRegistry::new()
             .by_client_and_platform("qoder_cli", PlatformId::Codex)
@@ -321,6 +472,18 @@ mod tests {
         TargetAdapterRegistry::new()
             .by_client_and_platform("qoder_cli", PlatformId::Claude)
             .expect("qoder claude adapter")
+    }
+
+    fn cn_codex_adapter() -> std::sync::Arc<dyn TargetAdapter> {
+        TargetAdapterRegistry::new()
+            .by_client_and_platform("qoder_cn_cli", PlatformId::Codex)
+            .expect("qoder cn codex adapter")
+    }
+
+    fn cn_claude_adapter() -> std::sync::Arc<dyn TargetAdapter> {
+        TargetAdapterRegistry::new()
+            .by_client_and_platform("qoder_cn_cli", PlatformId::Claude)
+            .expect("qoder cn claude adapter")
     }
 
     fn render(adapter: &dyn TargetAdapter, existing: Option<&[u8]>, models: &[&str]) -> Value {
@@ -350,30 +513,163 @@ mod tests {
 
     #[test]
     fn adapter_identity_declares_qoder_as_a_restart_required_non_native_client() {
-        for adapter in [codex_adapter(), claude_adapter()] {
-            assert_eq!(adapter.client_key(), "qoder_cli");
+        for adapter in [
+            codex_adapter(),
+            claude_adapter(),
+            cn_codex_adapter(),
+            cn_claude_adapter(),
+        ] {
             assert!(!adapter.native());
             // The settings schema marks `providers` requiresRestart.
             assert!(adapter.restart_required());
             assert!(adapter.requires_client_models());
         }
+        assert_eq!(codex_adapter().client_key(), "qoder_cli");
+        assert_eq!(claude_adapter().client_key(), "qoder_cli");
+        assert_eq!(cn_codex_adapter().client_key(), "qoder_cn_cli");
+        assert_eq!(cn_claude_adapter().client_key(), "qoder_cn_cli");
         assert_eq!(codex_adapter().target_key(), "qoder_cli_codex");
         assert_eq!(claude_adapter().target_key(), "qoder_cli_claude");
+        assert_eq!(cn_codex_adapter().target_key(), "qoder_cn_cli_codex");
+        assert_eq!(cn_claude_adapter().target_key(), "qoder_cn_cli_claude");
     }
 
     #[test]
-    fn resolved_path_is_the_user_level_cli_settings_file() {
+    fn the_two_flavors_read_their_own_config_directories() {
         let home = Path::new("/home/user");
+        // `@qoder-ai/qodercli` reads the international file...
         assert_eq!(
             codex_adapter().resolve_path(home),
             home.join(".qoder").join("settings.json")
+        );
+        // ...and `@qodercn-ai/qoderclicn` reads the China one. One tree builds
+        // both: the CLI picks `.qoder-cn` over `.qoder` from its `isCn` flag.
+        assert_eq!(
+            cn_codex_adapter().resolve_path(home),
+            home.join(".qoder-cn").join("settings.json")
+        );
+        assert_eq!(
+            cn_claude_adapter().resolve_path(home),
+            home.join(".qoder-cn").join("settings.json")
+        );
+        assert_ne!(
+            codex_adapter().resolve_path(home),
+            cn_codex_adapter().resolve_path(home)
+        );
+    }
+
+    #[test]
+    fn the_china_build_accepts_the_same_provider_document() {
+        // Both bundles carry one validator (`ite`/`YJl` in the shipped code) and
+        // one `openai-compatible` protocol table, so the renderer is shared and
+        // only the directory differs. Assert the fields the validator checks.
+        let json = render(cn_codex_adapter().as_ref(), None, &["gpt-5.6-sol"]);
+        let entry = &json["providers"]["ai-switch-codex"];
+
+        assert_eq!(entry["type"], "openai-compatible");
+        assert_eq!(entry["baseUrl"], "http://127.0.0.1:19527/v1");
+        assert_eq!(entry["apiKey"], CODEX_KEY);
+        assert_eq!(entry["models"][0]["model"], "gpt-5.6-sol");
+        assert_eq!(entry["models"][0]["contextWindow"], 200_000);
+        assert_eq!(entry["models"][0]["maxOutputTokens"], 128_000);
+    }
+
+    #[test]
+    fn declared_reasoning_levels_reach_the_model_capabilities() {
+        // Qoder reads the picker's effort list from `capabilities.thinking.
+        // supportedEffortLevels`; without it the model has no tier control.
+        let input = input_with_levels("deepseek-v4.1", &["low", "medium", "high", "max"]);
+        let bytes = codex_adapter()
+            .render(Path::new("settings.json"), None, &input)
+            .expect("render");
+        let json: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        let thinking = &json["providers"]["ai-switch-codex"]["models"][0]["capabilities"]["thinking"];
+
+        assert_eq!(
+            thinking["supportedEffortLevels"],
+            serde_json::json!(["low", "medium", "high", "max"])
+        );
+        // `modes` is a closed enum in the CLI: only these two are accepted.
+        assert_eq!(
+            thinking["modes"],
+            serde_json::json!(["enabled", "adaptive"])
+        );
+        // A model record may not carry `thinking` at its own level — the
+        // validator treats it like `maxTokens` and rejects the whole model.
+        assert!(json["providers"]["ai-switch-codex"]["models"][0]
+            .get("thinking")
+            .is_none());
+        assert!(json["providers"]["ai-switch-codex"]
+            .get("thinking")
+            .is_none());
+    }
+
+    #[test]
+    fn a_ladder_without_declared_levels_carries_no_thinking_block() {
+        // An empty ladder means "the account declared nothing". Writing an empty
+        // `supportedEffortLevels` would still render a tier control with no
+        // tiers, so the block is omitted entirely.
+        let json = render(codex_adapter().as_ref(), None, &["gpt-5.6-sol"]);
+        let capabilities = &json["providers"]["ai-switch-codex"]["models"][0]["capabilities"];
+
+        assert!(capabilities.get("thinking").is_none());
+        // The rest of the capability record is unaffected.
+        assert_eq!(capabilities["tools"], true);
+        assert_eq!(capabilities["vision"], true);
+    }
+
+    #[test]
+    fn only_efforts_the_cli_recognises_are_advertised() {
+        // `none` is stripped: Qoder appends it itself when a ladder omits it, so
+        // declaring it would add a duplicate, empty tier. Anything the CLI does
+        // not know is dropped rather than forwarded — the client throws while
+        // building a request whose effort is missing from this list.
+        let input = input_with_levels(
+            "deepseek-v4.1",
+            &["none", "LOW", "medium", " insane ", "max", "low"],
+        );
+        let bytes = codex_adapter()
+            .render(Path::new("settings.json"), None, &input)
+            .expect("render");
+        let json: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        let levels = &json["providers"]["ai-switch-codex"]["models"][0]["capabilities"]["thinking"]
+            ["supportedEffortLevels"];
+
+        // Lowercased, deduped, `none` dropped, unknown dropped, order preserved.
+        assert_eq!(levels, &serde_json::json!(["low", "medium", "max"]));
+    }
+
+    #[test]
+    fn deliberation_modes_do_not_leak_into_the_provider_record() {
+        // The provider level has no reasoning field, and a stray one makes Qoder
+        // discard the whole provider. The tiers belong to each model.
+        let input = input_with_levels("deepseek-v4.1", &["low", "high"]);
+        let bytes = codex_adapter()
+            .render(Path::new("settings.json"), None, &input)
+            .expect("render");
+        let json: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        let provider = json["providers"]["ai-switch-codex"]
+            .as_object()
+            .expect("provider object");
+
+        assert!(!provider.contains_key("thinking"));
+        assert!(!provider.contains_key("reasoning"));
+        assert!(!provider.contains_key("temperature"));
+        assert_eq!(
+            provider["models"][0]["capabilities"]["thinking"]["supportedEffortLevels"],
+            serde_json::json!(["low", "high"])
         );
     }
 
     #[test]
     fn provider_ids_are_valid_and_never_the_reserved_name() {
         // `^[A-Za-z0-9][A-Za-z0-9._-]*$`, and `qoder` is rejected by the CLI.
-        for adapter in [codex_adapter(), claude_adapter()] {
+        for adapter in [
+            codex_adapter(),
+            claude_adapter(),
+            cn_codex_adapter(),
+            cn_claude_adapter(),
+        ] {
             let json = render(adapter.as_ref(), None, &["gpt-5.6-sol"]);
             let providers = json["providers"].as_object().expect("providers object");
             for id in providers.keys() {

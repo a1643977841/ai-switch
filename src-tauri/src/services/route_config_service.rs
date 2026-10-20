@@ -694,6 +694,13 @@ impl RouteConfigService {
         let members = catalog_members(&catalog_member_inputs(&credentials));
         let mode = RoutePoolRepository::model_mode(pool, PlatformId::Codex.as_str()).await?;
         let payload = codex_model_catalog_payload(&members, mode);
+        // The desktop build filters every model's ladder through a global
+        // enabled-efforts set that defaults to low/medium/high/xhigh/ultra/
+        // persistent and therefore has no `max`. A model that declares `max`
+        // loses it in the picker while the catalog still advertises it, which
+        // reads as "I ticked max but the client only offers high". Teach the
+        // client the tiers this catalog actually uses.
+        Self::align_codex_enabled_reasoning_efforts(home, &payload).await;
         let bytes = serde_json::to_vec_pretty(&payload).map_err(|err| AppError::Validation {
             code: "validation.codex_model_catalog_serialization",
             message: "Could not serialize Codex model catalog".to_string(),
@@ -720,6 +727,144 @@ impl RouteConfigService {
                 recoverable: true,
             })
     }
+
+    /// Brings the Codex desktop's global `enabled-reasoning-efforts` set in line
+    /// with the tiers this catalog actually advertises.
+    ///
+    /// The desktop UI keeps a single whitelist of selectable efforts — persisted
+    /// as a "persisted atom" under `enabled-reasoning-efforts`, defaulting to
+    /// `["low","medium","high","xhigh","ultra","persistent"]` — and filters every
+    /// model's declared ladder through it. `KNt` (the "is this a real effort"
+    /// guard it runs first) does accept `max`, so the whitelist is the only thing
+    /// dropping it. That is why a model can carry `max` in the catalog yet show
+    /// only `low/medium/high` in the picker.
+    ///
+    /// The set is additive on purpose: it never removes a tier the user enabled
+    /// by hand, and it is a no-op when the client has no state file yet (the CLI
+    /// never reads it) or already lists everything. Failing to write it must not
+    /// cost the user their catalog, so every error here is swallowed — the
+    /// catalog is still correct and the CLI still works.
+    async fn align_codex_enabled_reasoning_efforts(home: &Path, payload: &Value) {
+        let advertised = advertised_codex_reasoning_efforts(payload);
+        if advertised.is_empty() {
+            return;
+        }
+        let global_state = codex_global_state_path(home);
+        let Ok(raw) = tokio::fs::read_to_string(&global_state).await else {
+            return;
+        };
+        let Ok(mut document) = serde_json::from_str::<Value>(&raw) else {
+            return;
+        };
+        let Some(atom) = document
+            .get_mut("electron-persisted-atom-state")
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+
+        // The host prefixes atom keys by writer — `diff-filter` lands bare while
+        // the onboarding atoms land as `electron:<key>`. Which form this atom
+        // takes is therefore not something to guess: touch every existing key
+        // that names it, and seed the bare key when none exists yet (that is the
+        // shape the settings registry itself declares).
+        let mut targets: Vec<String> = atom
+            .keys()
+            .filter(|key| {
+                key.as_str() == ATOM_KEY
+                    || key
+                        .strip_suffix(ATOM_KEY)
+                        .is_some_and(|prefix| prefix == "electron:" || prefix == "electron-")
+            })
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            targets.push(ATOM_KEY.to_string());
+        }
+
+        let mut changed = false;
+        for target in targets {
+            let current = atom
+                .get(&target)
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    CODEX_DESKTOP_DEFAULT_REASONING_EFFORTS
+                        .iter()
+                        .map(|level| (*level).to_string())
+                        .collect()
+                });
+
+            let mut merged = current.clone();
+            for level in &advertised {
+                if !merged.iter().any(|existing| existing == level) {
+                    merged.push(level.clone());
+                }
+            }
+            if merged == current {
+                continue;
+            }
+            changed = true;
+            atom.insert(
+                target,
+                Value::Array(merged.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        if !changed {
+            return;
+        }
+        if let Ok(serialized) = serde_json::to_vec_pretty(&document) {
+            let _ = tokio::fs::write(&global_state, serialized).await;
+        }
+    }
+}
+
+/// The settings-registry key for the desktop's selectable-effort whitelist.
+const ATOM_KEY: &str = "enabled-reasoning-efforts";
+
+/// The desktop's built-in enabled-effort set. Mirrored so the merge above has a
+/// starting point when the client has not written the atom yet; `max` is absent
+/// on purpose, which is the whole bug this guards against.
+const CODEX_DESKTOP_DEFAULT_REASONING_EFFORTS: &[&str] = &[
+    "low", "medium", "high", "xhigh", "ultra", "persistent",
+];
+
+fn codex_global_state_path(home: &Path) -> PathBuf {
+    home.join(".codex").join(".codex-global-state.json")
+}
+
+/// Every effort any model in the catalog advertises, in catalog order.
+fn advertised_codex_reasoning_efforts(payload: &Value) -> Vec<String> {
+    let mut efforts = Vec::new();
+    let Some(models) = payload.get("models").and_then(Value::as_array) else {
+        return efforts;
+    };
+    for model in models {
+        let Some(levels) = model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for effort in levels.iter().filter_map(|entry| {
+            entry
+                .get("effort")
+                .and_then(Value::as_str)
+                .or_else(|| entry.as_str())
+        }) {
+            if !efforts.iter().any(|existing| existing == effort) {
+                efforts.push(effort.to_string());
+            }
+        }
+    }
+    efforts
 }
 
 fn skipped_outcome(target_key: &str, platform: &str, error_code: &str) -> ConfigWriteOutcome {
@@ -868,6 +1013,178 @@ mod tests {
     use chrono::Utc;
 
     const BASE_URL: &str = "http://127.0.0.1:43111";
+
+    #[test]
+    fn advertised_efforts_collect_every_tier_the_catalog_uses() {
+        let payload = serde_json::json!({
+            "models": [
+                { "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "max" }] },
+                { "supported_reasoning_levels": [{ "effort": "high" }, { "effort": "max" }] },
+                { "supported_reasoning_levels": [] },
+                { "supported_reasoning_levels": ["medium"] }
+            ]
+        });
+
+        assert_eq!(
+            advertised_codex_reasoning_efforts(&payload),
+            vec!["low", "max", "high", "medium"]
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_max_to_the_desktop_effort_set_keeps_hand_picked_tiers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path();
+        let state_path = codex_global_state_path(home);
+        std::fs::create_dir_all(state_path.parent().expect("dir")).expect("mkdir");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "enabled-reasoning-efforts": ["low", "medium", "high", "xhigh", "ultra", "persistent"],
+                    "diff-filter": "last-turn"
+                },
+                "local-projects": ["keep-me"]
+            }))
+            .expect("json"),
+        )
+        .expect("write");
+
+        let payload = serde_json::json!({
+            "models": [
+                { "supported_reasoning_levels": [
+                    { "effort": "low" }, { "effort": "medium" },
+                    { "effort": "high" }, { "effort": "max" }
+                ] }
+            ]
+        });
+        RouteConfigService::align_codex_enabled_reasoning_efforts(home, &payload).await;
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read"))
+                .expect("parse");
+        let atom = written["electron-persisted-atom-state"]
+            .as_object()
+            .expect("atom state");
+        // `max` joins the set; nothing the client already had is dropped.
+        assert_eq!(
+            atom["enabled-reasoning-efforts"],
+            serde_json::json!(["low", "medium", "high", "xhigh", "ultra", "persistent", "max"])
+        );
+        // Unrelated atoms and top-level keys survive the rewrite.
+        assert_eq!(atom["diff-filter"], serde_json::json!("last-turn"));
+        assert_eq!(written["local-projects"], serde_json::json!(["keep-me"]));
+    }
+
+    #[tokio::test]
+    async fn align_efforts_updates_every_prefix_shape_the_host_uses() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path();
+        let state_path = codex_global_state_path(home);
+        std::fs::create_dir_all(state_path.parent().expect("dir")).expect("mkdir");
+        // The host writes atom keys bare, as `electron:<key>`, or as
+        // `electron-<key>` depending on the writer. All three must learn `max`.
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "enabled-reasoning-efforts": ["low", "high"],
+                    "electron:enabled-reasoning-efforts": ["medium", "high"],
+                    "diff-filter": "last-turn"
+                }
+            }))
+            .expect("json"),
+        )
+        .expect("write");
+
+        let payload = serde_json::json!({
+            "models": [{ "supported_reasoning_levels": [{ "effort": "max" }] }]
+        });
+        RouteConfigService::align_codex_enabled_reasoning_efforts(home, &payload).await;
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read"))
+                .expect("parse");
+        let atom = written["electron-persisted-atom-state"].as_object().expect("atom");
+        assert_eq!(
+            atom["enabled-reasoning-efforts"],
+            serde_json::json!(["low", "high", "max"])
+        );
+        assert_eq!(
+            atom["electron:enabled-reasoning-efforts"],
+            serde_json::json!(["medium", "high", "max"])
+        );
+        assert_eq!(atom["diff-filter"], serde_json::json!("last-turn"));
+        assert!(atom.get("electron:enabled-reasoning-efforts").is_some());
+    }
+
+    #[tokio::test]
+    async fn align_efforts_seeds_the_bare_key_when_the_client_never_wrote_one() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path();
+        let state_path = codex_global_state_path(home);
+        std::fs::create_dir_all(state_path.parent().expect("dir")).expect("mkdir");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "electron-persisted-atom-state": { "diff-filter": "last-turn" }
+            }))
+            .expect("json"),
+        )
+        .expect("write");
+
+        let payload = serde_json::json!({
+            "models": [{ "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "max" }] }]
+        });
+        RouteConfigService::align_codex_enabled_reasoning_efforts(home, &payload).await;
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read"))
+                .expect("parse");
+        // No key existed, so the seed starts from the desktop's own default set
+        // and gains only what the catalog adds.
+        assert_eq!(
+            written["electron-persisted-atom-state"]["enabled-reasoning-efforts"],
+            serde_json::json!(["low", "medium", "high", "xhigh", "ultra", "persistent", "max"])
+        );
+    }
+
+    #[tokio::test]
+    async fn aligning_efforts_leaves_a_file_that_already_lists_max_untouched() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path();
+        let state_path = codex_global_state_path(home);
+        std::fs::create_dir_all(state_path.parent().expect("dir")).expect("mkdir");
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "electron-persisted-atom-state": {
+                "enabled-reasoning-efforts": ["low", "medium", "high", "max"]
+            }
+        }))
+        .expect("json");
+        std::fs::write(&state_path, &original).expect("write");
+
+        let payload = serde_json::json!({
+            "models": [{ "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "max" }] }]
+        });
+        RouteConfigService::align_codex_enabled_reasoning_efforts(home, &payload).await;
+
+        // Byte-identical: a no-op must not rewrite the client's state file.
+        assert_eq!(std::fs::read(&state_path).expect("read"), original);
+    }
+
+    #[tokio::test]
+    async fn aligning_efforts_is_a_no_op_without_a_client_state_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let payload = serde_json::json!({
+            "models": [{ "supported_reasoning_levels": [{ "effort": "max" }] }]
+        });
+
+        RouteConfigService::align_codex_enabled_reasoning_efforts(temp.path(), &payload).await;
+
+        // The CLI-only setup ships no desktop state file; writing one here would
+        // create a half-initialised document the client may then treat as canon.
+        assert!(!codex_global_state_path(temp.path()).exists());
+    }
 
     #[test]
     fn generated_route_proxy_key_uses_sk_shape() {
@@ -2460,7 +2777,7 @@ command = "npx"
     }
 
     #[tokio::test]
-    async fn codex_config_writes_a_high_default_reasoning_effort() {
+    async fn codex_config_writes_the_selected_models_top_reasoning_effort() {
         let fixture = ServiceFixture::new().await;
         seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
 
@@ -2479,7 +2796,39 @@ command = "npx"
         let codex_config = tokio::fs::read_to_string(fixture.home.join(".codex/config.toml"))
             .await
             .expect("codex config");
-        assert!(codex_config.contains("model_reasoning_effort = \"high\""));
+        // `gpt-5.6-sol` ships low→ultra, so the client opens on `ultra` — the same
+        // tier the catalog advertises as its default. A fixed `high` used to win
+        // here and silently cap every model whose ladder went higher.
+        assert!(codex_config.contains("model_reasoning_effort = \"ultra\""));
+    }
+
+    #[tokio::test]
+    async fn codex_config_carries_a_declared_reasoning_list_into_the_root_effort() {
+        let fixture = ServiceFixture::new().await;
+        // An account that deliberately caps a model at `medium`: the root effort
+        // has to follow the declaration, not the model's shipped ladder.
+        seed_codex_pool_member_with_config(
+            &fixture.pool,
+            r#"{"model_mappings":[{"from":"relay-model","to":"relay-model","reasoning_levels":["low","medium"]}]}"#,
+        )
+        .await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["codex".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let codex_config = tokio::fs::read_to_string(fixture.home.join(".codex/config.toml"))
+            .await
+            .expect("codex config");
+        assert!(codex_config.contains("model_reasoning_effort = \"medium\""));
     }
 
     #[tokio::test]

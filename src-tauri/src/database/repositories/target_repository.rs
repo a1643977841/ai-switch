@@ -46,6 +46,10 @@ impl TargetRepository {
             ("codebuddy_cli_claude", "claude", "CodeBuddy CLI (Claude)"),
             ("qoder_cli_codex", "codex", "Qoder CLI (Codex)"),
             ("qoder_cli_claude", "claude", "Qoder CLI (Claude)"),
+            // The China build keeps its settings in `~/.qoder-cn`, so it is a
+            // second install rather than the same client under another name.
+            ("qoder_cn_cli_codex", "codex", "Qoder CN CLI (Codex)"),
+            ("qoder_cn_cli_claude", "claude", "Qoder CN CLI (Claude)"),
             ("opencode", "opencode", "OpenCode"),
             ("openclaw", "openclaw", "OpenClaw"),
             ("hermes", "hermes", "Hermes"),

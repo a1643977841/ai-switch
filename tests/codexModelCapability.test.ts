@@ -44,9 +44,38 @@ describe("codexModelCapability", () => {
   });
 
   it("falls back to low/medium/high for a relay's own model id", () => {
-    expect(codexBaselineReasoningLevels("deepseek-v4-flash")).toEqual(["low", "medium", "high"]);
+    expect(codexBaselineReasoningLevels("some-relay-model")).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
     // Matching is case-insensitive so a pasted id still finds its profile.
     expect(codexBaselineReasoningLevels(" GPT-5.5 ")).toEqual(["low", "medium", "high", "xhigh"]);
+  });
+
+  it("gives DeepSeek-V4 the max tier in the Codex catalog too", () => {
+    // The catalog and the third-party configs used to disagree here: the account
+    // editor previewed three tiers while ZCode was handed four, so the Codex row —
+    // the one the per-mapping declaration exists for — was the side that lost it.
+    for (const upstream of [
+      "deepseek-v4",
+      "deepseek-v4-flash-0731",
+      "DeepSeek-V4.1",
+      "z-ai/deepseek-v4-flash",
+    ]) {
+      expect(codexBaselineReasoningLevels(upstream)).toEqual([
+        "low",
+        "medium",
+        "high",
+        "max",
+      ]);
+    }
+    // An older generation of the family is not covered by the rule.
+    expect(codexBaselineReasoningLevels("deepseek-v3-chat")).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
   });
 
   it("treats an absent or empty list as following the baseline", () => {
@@ -189,6 +218,7 @@ describe("codexModelCapability", () => {
       default_reasoning_levels: string[];
       third_party_default_reasoning_levels: string[];
       third_party_deepseek_v4_extra_reasoning_level: string;
+      deepseek_v4_reasoning_levels: string[];
       one_m_upstream_prefixes: string[];
       baseline_context_windows: Record<string, number>;
       default_context_window: number;
@@ -204,7 +234,8 @@ describe("codexModelCapability", () => {
     for (const [model, levels] of Object.entries(fixture.baseline_reasoning_profiles)) {
       expect([...thirdPartyDefaultReasoningLevels(model)]).toEqual(levels);
     }
-    expect([...codexBaselineReasoningLevels("some-relay-model")]).toEqual(
+    // A relay's own id is still unknown, so it keeps the conservative three.
+    expect(codexBaselineReasoningLevels("some-relay-model")).toEqual(
       fixture.default_reasoning_levels,
     );
     expect([...thirdPartyDefaultReasoningLevels("some-relay-model")]).toEqual(

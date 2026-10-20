@@ -187,6 +187,10 @@ impl TargetAdapterRegistry {
                 Arc::new(WorkBuddyAdapter::codebuddy_claude()),
                 Arc::new(QoderCliAdapter::codex()),
                 Arc::new(QoderCliAdapter::claude()),
+                // Qoder CN is a separate install with its own config directory
+                // (`~/.qoder-cn`), not a rename of the international build.
+                Arc::new(QoderCliAdapter::cn_codex()),
+                Arc::new(QoderCliAdapter::cn_claude()),
                 // Each of these three is its own platform's CLI rather than a
                 // second client for Codex or Claude: they hold their own pool,
                 // their own proxy key and their own model list.
@@ -747,7 +751,8 @@ api_key = "legacy-key"
                 "workbuddy",
                 "workbuddy_ai",
                 "codebuddy_cli",
-                "qoder_cli"
+                "qoder_cli",
+                "qoder_cn_cli"
             ]
         );
         assert_eq!(codex[0].display_name, "Codex CLI");
@@ -779,7 +784,8 @@ api_key = "legacy-key"
                 "workbuddy",
                 "workbuddy_ai",
                 "codebuddy_cli",
-                "qoder_cli"
+                "qoder_cli",
+                "qoder_cn_cli"
             ]
         );
         assert_eq!(claude[0].display_name, "Claude Code");

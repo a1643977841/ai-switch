@@ -401,7 +401,12 @@ experimental_bearer_token = "sentinel"
 
         // Third-party clients whose file was never created report `missing`
         // rather than erroring the whole listing.
-        for key in ["deepseek_harness", "workbuddy", "qoder_cli"] {
+        for key in [
+            "deepseek_harness",
+            "workbuddy",
+            "qoder_cli",
+            "qoder_cn_cli",
+        ] {
             assert_eq!(client(key).file_status, "missing", "{key}");
             assert!(client(key).config_path.is_some(), "{key}");
         }

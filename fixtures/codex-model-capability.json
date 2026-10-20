@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared source of truth for the Codex model-capability tables that both src-tauri/src/services/route_model_capability.rs and src/lib/codexModelCapability.ts implement. Each side has a test that compares its own constants to this file, so changing one without the other fails there rather than silently drifting until a client is told something the catalog will not honour. Update this file first, then both sides.",
+  "_comment": "Shared source of truth for the Codex model-capability tables that both src-tauri/src/services/route_model_capability.rs and src/lib/codexModelCapability.ts implement. Each side has a test that compares its own constants to this file, so changing one without the other fails there rather than silently drifting until a client is told something the catalog will not honour. Update this file first, then both sides. `deepseek_v4_reasoning_levels` is the ladder both the Codex catalog AND third-party client configs use for an undeclared DeepSeek-V4 model — they used to disagree, and Codex was the side that lost `max`.",
   "recognised_reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
   "baseline_reasoning_profiles": {
     "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -11,6 +11,7 @@
   "default_reasoning_levels": ["low", "medium", "high"],
   "third_party_default_reasoning_levels": ["low", "medium", "high"],
   "third_party_deepseek_v4_extra_reasoning_level": "max",
+  "deepseek_v4_reasoning_levels": ["low", "medium", "high", "max"],
   "one_m_upstream_prefixes": ["deepseek-v4", "glm-5.2", "glm-5.3", "qwen-3.8", "kimi-k3", "claude-", "anthropic/claude-"],
   "baseline_context_windows": {
     "gpt-6-astra": 1050000,

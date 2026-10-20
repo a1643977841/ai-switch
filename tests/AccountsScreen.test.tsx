@@ -56,6 +56,7 @@ import {
   previewExternalClientImport,
 } from "../src/lib/api/client";
 import { recognizeApiKeysFromImageBlob } from "../src/lib/ocr/apiKeyOcr";
+import type { FetchedRouteModel } from "../src/lib/api/types";
 import { ACCOUNT_LIST_LAYOUT_STORAGE_KEY } from "../src/lib/accountListLayout";
 import { ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY } from "../src/lib/accountDisplayPreferences";
 import { CODEX_MODEL_TEST_ENDPOINT_STORAGE_KEY } from "../src/lib/codexModelTestEndpoint";
@@ -4264,6 +4265,102 @@ describe("AccountsScreen", () => {
     expect(screen.getByLabelText("声明支持 1M 1")).toBeInTheDocument();
     expect(screen.queryByLabelText("上下文长度 1")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("推理程度 high 1")).not.toBeInTheDocument();
+  });
+
+  it("keeps a ticked reasoning effort through the save round trip", async () => {
+    // The whole complaint this guards: the box reads checked, the account saves,
+    // and the catalog still advertises the baseline ladder. The tick has to reach
+    // `config_json.model_mappings[].reasoning_levels`.
+    const api = {
+      ...credentialsFixture[1],
+      status: "ok" as const,
+      config_json: JSON.stringify({
+        base_url: "https://api.example.com/v1",
+        interface_format: "openai-responses",
+        model_mappings: [{ from: "glm-5.3-flash-free", to: "glm-5.3-flash-free" }],
+      }),
+    };
+    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
+    vi.mocked(updateRouteCredential).mockResolvedValue({ ...api, id: api.id });
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
+
+    // The row follows the baseline three tiers until something is ticked.
+    expect(await screen.findByText("跟随基准模型")).toBeInTheDocument();
+    expect(screen.getByLabelText("推理程度 max 1")).not.toBeChecked();
+
+    await userEvent.click(screen.getByLabelText("推理程度 max 1"));
+    expect(screen.getByLabelText("推理程度 max 1")).toBeChecked();
+    expect(screen.getByText("自定义")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls.at(-1)?.[1] as {
+      config_json: string;
+    };
+    const mappings = JSON.parse(payload.config_json).model_mappings as Array<{
+      reasoning_levels?: string[];
+    }>;
+    expect(mappings[0].reasoning_levels).toEqual(["low", "medium", "high", "max"]);
+  });
+
+  it("keeps hand-set efforts when one-click setup rebuilds the rows", async () => {
+    // One-click 设置 used to rebuild every row from `{from, to}` alone, dropping
+    // the reasoning ladder the user had ticked. The checkbox came back unticked
+    // and the catalog silently reverted to the baseline — indistinguishable from
+    // "the account editor did not save my max".
+    const api = {
+      ...credentialsFixture[1],
+      status: "ok" as const,
+      config_json: JSON.stringify({
+        base_url: "https://api.example.com/v1",
+        interface_format: "openai-responses",
+        model_mappings: [
+          {
+            from: "glm-5.3-flash-free",
+            to: "glm-5.3-flash-free",
+            context_window: 400_000,
+            reasoning_levels: ["low", "medium", "high", "max"],
+          },
+        ],
+      }),
+    };
+    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
+    vi.mocked(fetchRouteModels).mockResolvedValue([
+      { id: "glm-5.3-flash-free" } as FetchedRouteModel,
+      { id: "brand-new-model" } as FetchedRouteModel,
+    ]);
+    vi.mocked(updateRouteCredential).mockResolvedValue({ ...api, id: api.id });
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
+    await userEvent.click(await screen.findByRole("button", { name: "获取模型列表" }));
+    await userEvent.click(await screen.findByRole("button", { name: "一键设置" }));
+
+    // The carried row keeps its declaration; the new row starts on the baseline.
+    expect(await screen.findByLabelText("推理程度 max 1")).toBeChecked();
+    expect(screen.getByLabelText("上下文长度 1")).toHaveValue("400000");
+
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls.at(-1)?.[1] as {
+      config_json: string;
+    };
+    const mappings = JSON.parse(payload.config_json).model_mappings as Array<{
+      from: string;
+      reasoning_levels?: string[];
+      context_window?: number;
+    }>;
+    expect(mappings[0]).toMatchObject({
+      from: "glm-5.3-flash-free",
+      reasoning_levels: ["low", "medium", "high", "max"],
+      context_window: 400_000,
+    });
+    expect(mappings[1].from).toBe("brand-new-model");
+    expect(mappings[1].reasoning_levels).toBeUndefined();
   });
 
   it("shows an imported Codex row's own context window and efforts", async () => {

@@ -927,12 +927,58 @@ function isClaudeTemplateSource(value: string) {
   return claudeRoleTemplates.some((template) => template.value === value.trim());
 }
 
-function buildOneClickMappings(models: FetchedRouteModel[]) {
-  // `supports_image_input` stays absent so the row follows the built-in model
-  // table until the user explicitly overrides it.
+/** One-click 1:1 mapping for a freshly fetched model list.
+ *
+ * Rows that already exist are rebuilt from their own `from` id, so the capability
+ * declarations the user set by hand — `reasoning_levels`, `context_window`,
+ * `supports_image_input`, `capabilities`, `label` — survive the resync. Rebuilding
+ * from `{from, to}` alone silently reset every row to the baseline ladder, which
+ * reads exactly like "I ticked max and it disappeared": the checkbox came back
+ * unticked and the catalog went back to the profile default.
+ *
+ * `supports_image_input` stays absent when it was never set, so the row keeps
+ * following the built-in model table.
+ */
+function buildOneClickMappings(models: FetchedRouteModel[], existing: ModelMapping[] = []) {
+  const carriedByFrom = new Map<string, ModelMapping>();
+  for (const mapping of existing) {
+    const key = mapping.from.trim();
+    if (key) {
+      carriedByFrom.set(key, mapping);
+    }
+  }
   return models
     .filter((model) => model.id.trim())
-    .map((model) => ({ from: model.id, to: model.id }));
+    .map((model) => {
+      const id = model.id.trim();
+      const carried = carriedByFrom.get(id);
+      const rebuilt: ModelMapping = { from: id, to: id };
+      if (!carried) {
+        return rebuilt;
+      }
+      if (carried.label?.trim()) {
+        rebuilt.label = carried.label.trim();
+      }
+      if (carried.supports_image_input === true || carried.supports_image_input === false) {
+        rebuilt.supports_image_input = carried.supports_image_input;
+      }
+      const capabilities = carried.capabilities?.filter((value) => value.trim());
+      if (capabilities && capabilities.length > 0) {
+        rebuilt.capabilities = capabilities;
+      }
+      if (carried.supports_1m === true) {
+        rebuilt.supports_1m = true;
+      }
+      const contextWindow = normalizeCodexContextWindow(carried.context_window);
+      if (contextWindow !== null) {
+        rebuilt.context_window = contextWindow;
+      }
+      const reasoningLevels = normalizeCodexReasoningLevels(carried.reasoning_levels);
+      if (reasoningLevels.length > 0) {
+        rebuilt.reasoning_levels = reasoningLevels;
+      }
+      return rebuilt;
+    });
 }
 
 function parseModelMappingsFromConfig(configJson: string): ModelMapping[] {
@@ -2264,7 +2310,7 @@ function ModelMappingsEditor({
   };
 
   const oneClickSetup = () => {
-    onChange(buildOneClickMappings(fetchedModels));
+    onChange(buildOneClickMappings(fetchedModels, rows));
   };
 
   return (

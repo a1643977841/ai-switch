@@ -35,11 +35,40 @@ const CODEX_BASELINE_REASONING_PROFILES: Record<string, readonly string[]> = {
  * the three efforts every reasoning model understands. */
 const CODEX_DEFAULT_REASONING_LEVELS: readonly string[] = ["low", "medium", "high"];
 
+/** DeepSeek‑V4 family: the generic three plus `max`, matching
+ * `DEEPSEEK_V4_REASONING_LEVELS` on the Rust side. */
+const CODEX_DEEPSEEK_V4_REASONING_LEVELS: readonly string[] = [
+  "low",
+  "medium",
+  "high",
+  "max",
+];
+
+function isDeepSeekV4Model(model: string): boolean {
+  const name = model.trim().toLowerCase();
+  const bare = name.slice(name.lastIndexOf("/") + 1);
+  return name.startsWith("deepseek-v4") || bare.startsWith("deepseek-v4");
+}
+
+/** The ladder the tables describe for a model, or `null` when nothing does.
+ *
+ * Shared by both previews on purpose. They used to disagree for DeepSeek‑V4:
+ * `codexBaselineReasoningLevels` answered three tiers while
+ * `thirdPartyDefaultReasoningLevels` answered four, so the same undeclared model
+ * showed a different menu in the Codex catalog and in a third-party client — and
+ * the Codex row, which is the one the per-mapping declaration is written for,
+ * silently dropped `max`. */
+function describedReasoningLevels(model: string): readonly string[] | null {
+  const name = model.trim().toLowerCase();
+  const baseline = CODEX_BASELINE_REASONING_PROFILES[name];
+  if (baseline) {
+    return baseline;
+  }
+  return isDeepSeekV4Model(name) ? CODEX_DEEPSEEK_V4_REASONING_LEVELS : null;
+}
+
 export function codexBaselineReasoningLevels(model: string): readonly string[] {
-  return (
-    CODEX_BASELINE_REASONING_PROFILES[model.trim().toLowerCase()] ??
-    CODEX_DEFAULT_REASONING_LEVELS
-  );
+  return describedReasoningLevels(model) ?? CODEX_DEFAULT_REASONING_LEVELS;
 }
 
 /**
@@ -49,33 +78,14 @@ export function codexBaselineReasoningLevels(model: string): readonly string[] {
  * Mirrors `default_third_party_reasoning_levels` on the Rust side. A model the
  * profile table describes advertises **its own** ladder — Codex already shows all
  * six of `gpt-6-astra`'s tiers, and the generic three would read as "no reasoning
- * control" on a third-party client. Anything the table does not know keeps the
- * conservative `low`/`medium`/`high`; DeepSeek‑V4 upstreams additionally get a
- * `max` tier — the same ladder the backend writes into the client configs, so the
- * editor preview matches what the catalog produces.
+ * control" on a third-party client. DeepSeek‑V4 upstreams get `max` on top of the
+ * generic three, the same ladder the Codex catalog writes, so the editor preview
+ * matches what the catalog produces.
  */
-const CODEX_THIRD_PARTY_DEFAULT_REASONING_LEVELS: readonly string[] = [
-  "low",
-  "medium",
-  "high",
-];
-
 export function thirdPartyDefaultReasoningLevels(
   upstreamModel: string,
 ): readonly string[] {
-  const name = upstreamModel.trim().toLowerCase();
-  const baseline = CODEX_BASELINE_REASONING_PROFILES[name];
-  if (baseline) {
-    return baseline;
-  }
-  const bare = name.slice(name.lastIndexOf("/") + 1);
-  const isDeepSeekV4 =
-    name.startsWith("deepseek-v4") || bare.startsWith("deepseek-v4");
-  const base = [...CODEX_THIRD_PARTY_DEFAULT_REASONING_LEVELS];
-  if (isDeepSeekV4) {
-    base.push("max");
-  }
-  return base;
+  return describedReasoningLevels(upstreamModel) ?? CODEX_DEFAULT_REASONING_LEVELS;
 }
 
 /**

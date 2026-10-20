@@ -136,6 +136,10 @@ const TERRA_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max
 const LUNA_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const GPT_55_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
 const DEFAULT_REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
+/// The ladder a DeepSeek‑V4 family model offers once nothing else describes it.
+/// `max` is the top recognised effort and the family carries enough headroom for
+/// it to be a real choice rather than decoration.
+const DEEPSEEK_V4_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "max"];
 
 /// The ladder a model the tables describe ships, or `None` for a model they do
 /// not describe at all.
@@ -154,6 +158,19 @@ pub(crate) fn baseline_reasoning_levels(model: &str) -> Option<&'static [&'stati
     }
 }
 
+/// The ladder the tables describe for a model, or `None` when nothing does.
+///
+/// Shared by the Codex catalog and the third-party client configs on purpose.
+/// They used to disagree for DeepSeek‑V4: the catalog answered
+/// `low`/`medium`/`high` while ZCode and WorkBuddy were handed the same three
+/// plus `max`, so one undeclared model offered a different menu depending on
+/// which client asked — and the Codex row silently dropped the tier the user had
+/// just been granted everywhere else.
+pub(crate) fn described_reasoning_levels(model: &str) -> Option<&'static [&'static str]> {
+    baseline_reasoning_levels(model)
+        .or_else(|| is_deepseek_v4_upstream(model).then_some(DEEPSEEK_V4_REASONING_LEVELS))
+}
+
 /// Reasoning ladder advertised to **third-party clients** (ZCode, WorkBuddy,
 /// CodeBuddy) for a model whose account declared no `reasoning_levels`.
 ///
@@ -165,7 +182,15 @@ pub(crate) fn baseline_reasoning_levels(model: &str) -> Option<&'static [&'stati
 /// pick a tier. A minimal ladder restores that choice. `low`/`medium`/`high` are
 /// all in `RECOGNISED_REASONING_EFFORTS`, so the proxy bridges honour them and
 /// nothing is silently dropped from the request.
-pub(crate) const DEFAULT_THIRD_PARTY_REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
+/// The generic ladder used when neither the profile table nor a family rule
+/// describes a model. This is also what third-party clients get for an undeclared
+/// model the tables do not know — never an empty list, which would leave the
+/// client with only a bare on/off toggle and no tier to pick.
+///
+/// `DEFAULT_THIRD_PARTY_REASONING_LEVELS` used to be a separate constant holding
+/// the same three values; keeping two names for one statement let one of them
+/// drift without anything failing.
+pub(crate) const DEFAULT_THIRD_PARTY_REASONING_LEVELS: &[&str] = DEFAULT_REASONING_LEVELS;
 
 /// Whether the upstream model is a DeepSeek‑V4 family. Matched on the start of
 /// the mapped‑to name so every dated or sized variant (`deepseek-v4-flash-0731`,
@@ -193,18 +218,17 @@ fn is_deepseek_v4_upstream(upstream_model: &str) -> bool {
 /// `low`/`medium`/`high`/`max` for those models. `max` is in
 /// `RECOGNISED_REASONING_EFFORTS`, so the bridges honour it end to end and the
 /// request is not silently stripped.
+///
+/// That DeepSeek‑V4 rule lives in [`described_reasoning_levels`] so the Codex
+/// catalog applies it too: the two used to disagree, and Codex — the client the
+/// per-mapping declaration is actually written for — was the side that lost the
+/// tier.
 pub(crate) fn default_third_party_reasoning_levels(upstream_model: &str) -> Vec<String> {
-    if let Some(levels) = baseline_reasoning_levels(upstream_model) {
-        return levels.iter().map(|level| (*level).to_string()).collect();
-    }
-    let mut levels: Vec<String> = DEFAULT_THIRD_PARTY_REASONING_LEVELS
+    described_reasoning_levels(upstream_model)
+        .unwrap_or(DEFAULT_THIRD_PARTY_REASONING_LEVELS)
         .iter()
         .map(|level| (*level).to_string())
-        .collect();
-    if is_deepseek_v4_upstream(upstream_model) {
-        levels.push("max".to_string());
-    }
-    levels
+        .collect()
 }
 
 /// Context window written into the Codex catalog when a mapping declares none
@@ -336,7 +360,7 @@ pub(crate) fn codex_reasoning_profile(model: &str) -> CodexReasoningProfile {
         _ => "medium",
     };
     CodexReasoningProfile {
-        levels: baseline_reasoning_levels(&key).unwrap_or(DEFAULT_REASONING_LEVELS),
+        levels: described_reasoning_levels(&key).unwrap_or(DEFAULT_REASONING_LEVELS),
         default_level,
     }
 }
