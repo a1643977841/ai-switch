@@ -1,6 +1,6 @@
 # 内容过滤拒绝兼容 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 把上游内容过滤拒绝从账号健康故障中分流，并在账号级显式开启时为同一失败重试一次“省略较旧工具输出”的请求。
 
@@ -38,7 +38,7 @@
 - Produces: `pub(crate) fn is_content_rejection(failure: &SemanticResponseFailure) -> bool`。
 - Produces: `is_account_scoped_failure("content_rejected", status)` 返回 `false`。
 
-- [ ] **Step 1: 在 `response_failure_service.rs` 的测试模块写失败测试**
+- [x] **Step 1: 在 `response_failure_service.rs` 的测试模块写失败测试**
 
 在现有 `detect_response_failed_value` / 配额测试附近加入：
 
@@ -86,7 +86,7 @@ fn content_rejections_do_not_park_the_account() {
 }
 ```
 
-- [ ] **Step 2: 运行测试并确认失败**
+- [x] **Step 2: 运行测试并确认失败**
 
 Run:
 
@@ -96,7 +96,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib content_rejection
 
 Expected: 编译失败，提示 `is_content_rejection` 未定义；现有 `content_rejections_do_not_park_the_account` 若先单独运行则断言失败。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 在 `response_failure_service.rs` 的 `SemanticResponseFailure` 定义之后加入：
 
@@ -128,7 +128,7 @@ pub(crate) fn is_content_rejection(failure: &SemanticResponseFailure) -> bool {
 "content_rejected" => false,
 ```
 
-- [ ] **Step 4: 运行测试并确认通过**
+- [x] **Step 4: 运行测试并确认通过**
 
 Run:
 
@@ -139,7 +139,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib route_failure_sco
 
 Expected: 两个过滤条件均通过。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 cargo fmt --manifest-path src-tauri/Cargo.toml
@@ -159,7 +159,7 @@ git commit -m "feat(路由): 识别内容过滤拒绝"
 - Produces: `RouteCredentialRepository::record_content_rejection(pool: &SqlitePool, id: &str, message: &str, response_body: Option<&[u8]>) -> Result<(), AppError>`。
 - Produces: 当账号存在生效中的 `cooldown_until` / `next_retry_at` 时，该方法返回 `Ok(())` 且不覆盖已有 `last_failure_*`。
 
-- [ ] **Step 1: 写仓库失败测试**
+- [x] **Step 1: 写仓库失败测试**
 
 在 `route_credential_repository.rs` 测试模块最后加入：
 
@@ -279,7 +279,7 @@ async fn content_rejection_on_a_missing_account_is_a_validation_error() {
 }
 ```
 
-- [ ] **Step 2: 运行测试并确认失败**
+- [x] **Step 2: 运行测试并确认失败**
 
 Run:
 
@@ -289,7 +289,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib content_rejection
 
 Expected: 编译失败，提示 `record_content_rejection` 未定义。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 在 `RouteCredentialRepository` 的 `clear_transient_failure` 附近加入：
 
@@ -396,7 +396,7 @@ pub async fn record_content_rejection(
 }
 ```
 
-- [ ] **Step 4: 运行测试并确认通过**
+- [x] **Step 4: 运行测试并确认通过**
 
 Run:
 
@@ -406,7 +406,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib content_rejection
 
 Expected: 三个仓库测试与 Task 1 的识别测试全部通过。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 cargo fmt --manifest-path src-tauri/Cargo.toml
@@ -430,7 +430,7 @@ git commit -m "feat(路由): 记录内容过滤提示不记健康失败"
 - Produces: `pub(crate) fn elide_old_tool_outputs(body: &[u8]) -> Option<Vec<u8>>;`
 - Produces: `const ELIDED_TOOL_OUTPUT: &str` 与 `const KEEP_LATEST_TOOL_OUTPUTS: usize = 6`。
 
-- [ ] **Step 1: 写裁剪器失败测试**
+- [x] **Step 1: 写裁剪器失败测试**
 
 新建文件并在实现之前只放测试与模块骨架；测试代码必须包含以下完整用例：
 
@@ -590,7 +590,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试并确认失败**
+- [x] **Step 2: 运行测试并确认失败**
 
 Run:
 
@@ -600,7 +600,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib request_content_r
 
 Expected: 编译失败，提示模块常量与函数未定义。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 文件顶部加入：
 
@@ -768,7 +768,7 @@ fn elide_value(output: &mut Value, responses_shape: bool) -> bool {
 pub(crate) mod request_content_rejection;
 ```
 
-- [ ] **Step 4: 运行测试并确认通过**
+- [x] **Step 4: 运行测试并确认通过**
 
 Run:
 
@@ -778,7 +778,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib request_content_r
 
 Expected: 全部裁剪器测试通过；图片数组、短输出、非 JSON 返回 `None`。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 cargo fmt --manifest-path src-tauri/Cargo.toml
@@ -799,7 +799,7 @@ git commit -m "feat(路由): 添加旧工具输出裁剪器"
 - Produces: 主循环局部变量 `rejected_indexes: Vec<usize>`，记录本轮被内容过滤拒绝的候选下标。
 - Produces: `handle_stream_prime_failure` 新增 `rejected_indexes: &mut Vec<usize>` 参数；内容拒绝返回 `false` 且不重新入队。
 
-- [ ] **Step 1: 写 buffered 与 SSE 首帧失败测试**
+- [x] **Step 1: 写 buffered 与 SSE 首帧失败测试**
 
 在 `route_proxy_service.rs` 的测试模块加入：
 
@@ -962,7 +962,7 @@ async fn stream_prime_content_rejection_does_not_retry_the_same_account() {
 }
 ```
 
-- [ ] **Step 2: 运行测试并确认失败**
+- [x] **Step 2: 运行测试并确认失败**
 
 Run:
 
@@ -972,7 +972,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib content_rejection
 
 Expected: 当前实现把它当普通 500，第一账号被同号重试三次；`first_calls` 为 3 而不是 1。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 把 `is_content_rejection` 加入 `route_proxy_service.rs` 的 `response_failure_service` import。
 
@@ -1048,7 +1048,7 @@ if let Some(failure) = context
 
 该分支必须在 `retry_same_credential` 分支之前，确保 SSE 200 首帧拒绝也不会被记成 `"transport"` 或同号重试。
 
-- [ ] **Step 4: 运行测试并确认通过**
+- [x] **Step 4: 运行测试并确认通过**
 
 Run:
 
@@ -1058,7 +1058,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib content_rejection
 
 Expected: buffered、SSE、作用域、仓库和裁剪器测试全部通过；两个新代理测试都只增加 A 分流，不触发 B1。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 cargo fmt --manifest-path src-tauri/Cargo.toml
@@ -1081,7 +1081,7 @@ git commit -m "feat(路由): 内容过滤拒绝不重试同账号"
 - Produces: `fn content_rejection_retry_indexes(credentials: &[SelectedCredential], rejected_indexes: &[usize]) -> Vec<usize>`。
 - Produces: 主转发循环外层 `'attempts: loop`；第二轮仅由 `content_rejection_retry_indexes` 构造，且 `trimmed_content_rejection_retry = true` 后不会产生第三轮。
 
-- [ ] **Step 1: 写 B1 失败测试**
+- [x] **Step 1: 写 B1 失败测试**
 
 在测试模块加入以下完整用例：
 
@@ -1465,7 +1465,7 @@ async fn b1_runs_at_most_once_when_the_trimmed_request_is_rejected_again() {
 }
 ```
 
-- [ ] **Step 2: 运行测试并确认失败**
+- [x] **Step 2: 运行测试并确认失败**
 
 Run:
 
@@ -1475,7 +1475,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib content_rejection
 
 Expected: 第一轮结束后没有 B1 第二轮，返回 502；`enabled_calls` 为 1 而不是 2。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 在 `route_proxy_service.rs` 加入 import：
 
@@ -1556,7 +1556,7 @@ let mut trimmed_content_rejection_retry = false;
 
 每次进入第二轮前不要手动清空 `retry_errors`。第二轮成功时原有成功返回路径生效；第二轮仍失败时沿用现有循环末尾的聚合错误，`acquired_any` 与最终 `All route credentials failed` 逻辑均不改动。B1 只是多一轮候选，不改变错误汇总格式。
 
-- [ ] **Step 4: 运行 B1 测试并确认通过**
+- [x] **Step 4: 运行 B1 测试并确认通过**
 
 Run:
 
@@ -1568,7 +1568,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib precise_mode_b1
 
 Expected: A 只打一次后自然换号；关闭 failover 与精确模式都不碰新账号；启用 B1 的拒绝账号最多再打一次；trimmed 后仍拒绝不会出现第三次。
 
-- [ ] **Step 5: 跑代理回归测试并提交**
+- [x] **Step 5: 跑代理回归测试并提交**
 
 Run:
 
@@ -1606,7 +1606,7 @@ git commit -m "feat(路由): 内容过滤后裁剪旧工具输出重试"
 - Produces: 创建时仅把 `trim_old_tool_outputs` 写入 `config_json`；缺失或 `off` 不写该键。
 - Produces: 编辑时校验 `config_json.content_rejection_compat`，非法值在持久化前返回 `validation.content_rejection_compat`。
 
-- [ ] **Step 1: 写后端设置失败测试**
+- [x] **Step 1: 写后端设置失败测试**
 
 在 `route_credential_service.rs` 新增测试模块：
 
@@ -1749,7 +1749,7 @@ mod content_rejection_setting_tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试并确认失败**
+- [x] **Step 2: 运行测试并确认失败**
 
 Run:
 
@@ -1759,7 +1759,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo test --lib content_rejection
 
 Expected: 编译失败，提示 `CreateApiRouteCredentialInput` 没有 `content_rejection_compat` 字段。
 
-- [ ] **Step 3: 增加模型和 TypeScript 输入字段**
+- [x] **Step 3: 增加模型和 TypeScript 输入字段**
 
 在 `CreateApiRouteCredentialInput` 的 `force_reasoning_content` 旁加入：
 
@@ -1776,7 +1776,7 @@ pub content_rejection_compat: Option<String>,
 content_rejection_compat?: "trim_old_tool_outputs" | "off" | null;
 ```
 
-- [ ] **Step 4: 写服务校验与写入实现**
+- [x] **Step 4: 写服务校验与写入实现**
 
 在 `create_api` 的 `request_compression::validate` 之后加入：
 
@@ -1824,7 +1824,7 @@ content_rejection_compat: None,
 
 仓库中共有 27 个 `CreateApiRouteCredentialInput` 结构体字面量。按编译器报错逐项在 `force_reasoning_content` 后补同一缩进的 `content_rejection_compat: None`；其中 `deeplink_service.rs` 等非测试构造器也必须补。完成后重新运行 `cargo check`，直到没有 missing-field 错误。
 
-- [ ] **Step 5: 运行设置测试与编译检查**
+- [x] **Step 5: 运行设置测试与编译检查**
 
 Run:
 
@@ -1836,7 +1836,7 @@ pnpm typecheck
 
 Expected: 设置测试通过；`cargo check` 无缺失字段错误；TypeScript 输入字段可通过类型检查。
 
-- [ ] **Step 6: 格式化并提交**
+- [x] **Step 6: 格式化并提交**
 
 ```bash
 cargo fmt --manifest-path src-tauri/Cargo.toml
@@ -1860,7 +1860,7 @@ git commit -m "feat(路由): 增加账号级内容过滤兼容配置"
 - Produces: `contentRejectionCompatFromConfig(config): boolean`。
 - Produces: `apiConfigJsonWithFields` 新增最后一个可选参数 `contentRejectionCompat = false`，开启写键，关闭删除键。
 
-- [ ] **Step 1: 写 UI 失败测试**
+- [x] **Step 1: 写 UI 失败测试**
 
 在 `tests/AccountsScreen.test.tsx` 加入：
 
@@ -1949,7 +1949,7 @@ it("labels content rejection and explains content-blocked with the B1 state", as
 });
 ```
 
-- [ ] **Step 2: 运行测试并确认失败**
+- [x] **Step 2: 运行测试并确认失败**
 
 Run:
 
@@ -1959,7 +1959,7 @@ pnpm test:run tests/AccountsScreen.test.tsx -t "content rejection compatibility|
 
 Expected: 找不到“内容过滤兼容”复选框；创建请求缺少字段；提示仍只识别 `sensitive_words_detected`。
 
-- [ ] **Step 3: 写最小 UI 实现**
+- [x] **Step 3: 写最小 UI 实现**
 
 在状态声明区加入：
 
@@ -2102,7 +2102,7 @@ const contentRejected =
 ) : null}
 ```
 
-- [ ] **Step 4: 运行 UI 测试并确认通过**
+- [x] **Step 4: 运行 UI 测试并确认通过**
 
 Run:
 
@@ -2113,7 +2113,7 @@ pnpm typecheck
 
 Expected: 三个新测试通过；现有敏感词测试、编辑保存与账号创建测试继续通过。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 pnpm exec prettier --write src/screens/AccountsScreen.tsx tests/AccountsScreen.test.tsx
@@ -2133,7 +2133,7 @@ git commit -m "feat(账号): 增加内容过滤兼容开关与提示"
 - Consumes: 最终行为与 UI 文案。
 - Produces: 中文/英文用户文档，明确 A、B1、账号级开关、只保留最新 6 条工具输出、Brotli 无效。
 
-- [ ] **Step 1: 更新中文“敏感词检测提醒”章节**
+- [x] **Step 1: 更新中文“敏感词检测提醒”章节**
 
 把本节扩写为以下内容，并保持现有提醒原文不变：
 
@@ -2168,7 +2168,7 @@ ai-switch 会省略较早的工具输出并重试一次：
 含触发词的请求无论明文还是 Brotli 都返回 `sensitive_words_detected`。
 ```
 
-- [ ] **Step 2: 更新中文失败分类表**
+- [x] **Step 2: 更新中文失败分类表**
 
 在 `last_failure_kind` 表中加入：
 
@@ -2176,7 +2176,7 @@ ai-switch 会省略较早的工具输出并重试一次：
 | `content_rejected` | 上游按内容策略拒绝请求；只写提示，不增加失败次数、不冷却、不改账号状态 | 不归账号或模型健康 |
 ```
 
-- [ ] **Step 3: 更新英文对应章节**
+- [x] **Step 3: 更新英文对应章节**
 
 在 `docs-site/docs/en/guide/reliability.md` 写入等价英文内容：
 
@@ -2223,7 +2223,7 @@ Brotli in live tests.
 | `content_rejected` | The upstream rejected the request under a content policy; this only records a hint and does not change retry count, cooldown, or account status | Neither account nor model health |
 ```
 
-- [ ] **Step 4: 运行仓库全量验证**
+- [x] **Step 4: 运行仓库全量验证**
 
 Run:
 
@@ -2237,7 +2237,7 @@ cd src-tauri && CARGO_TARGET_DIR=target-codex cargo check
 
 Expected: 所有命令退出码为 0；Rust 输出中没有 failed test；不产生除 `src-tauri/target-codex/` 外的构建目录。
 
-- [ ] **Step 5: 检查工作区与 diff**
+- [x] **Step 5: 检查工作区与 diff**
 
 Run:
 
@@ -2249,7 +2249,7 @@ git diff --stat
 
 Expected: 只有两份 reliability 文档待提交；`git diff --check` 无输出。
 
-- [ ] **Step 6: 提交文档**
+- [x] **Step 6: 提交文档**
 
 ```bash
 git add docs-site/docs/guide/reliability.md docs-site/docs/en/guide/reliability.md
