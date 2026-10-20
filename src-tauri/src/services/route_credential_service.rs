@@ -538,6 +538,45 @@ impl RouteCredentialService {
         Self::get(pool, id).await
     }
 
+    /// Persist the account-level "force reasoning content" self-heal flag.
+    ///
+    /// A thinking upstream (DeepSeek/MiMo behind new-api) rejects a replayed
+    /// assistant turn when it lacks `reasoning_content` (code 11155 /
+    /// `reasoning_content_missing`). The proxy already self-heals the in-flight
+    /// request by force-adding the field once; enabling the flag here means every
+    /// later request from this account carries `reasoning_content` proactively, so
+    /// it never hits that error — and the one-shot in-flight retry — again.
+    ///
+    /// Idempotent: an account that already opts in is left untouched, and a config
+    /// that cannot be parsed is skipped rather than clobbered.
+    pub async fn enable_force_reasoning_content(
+        pool: &SqlitePool,
+        id: &str,
+    ) -> Result<(), AppError> {
+        let credential = RouteCredentialRepository::get(pool, id).await?;
+        let platform = credential.platform.clone();
+        let mut config = match serde_json::from_str::<Value>(&credential.config_json) {
+            Ok(Value::Object(map)) => map,
+            Ok(_) => serde_json::Map::new(),
+            Err(_) => return Ok(()),
+        };
+        if config
+            .get("force_reasoning_content")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Ok(());
+        }
+        config.insert(
+            "force_reasoning_content".to_string(),
+            json!(true),
+        );
+        let config_json = Value::Object(config).to_string();
+        RouteCredentialRepository::update_config_json(pool, id, &config_json).await?;
+        best_effort_sync(pool, &platform).await;
+        Ok(())
+    }
+
     /// Move the account-level cooldown deadline to `seconds` from now, or lift it
     /// when `seconds` is `0`.
     ///
@@ -3252,6 +3291,54 @@ mod plaintext_reasoning_setting_tests {
         assert!(RouteCredentialService::create_api(&pool, input)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn enable_force_reasoning_content_persists_flag_and_is_idempotent() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let input = json!({
+            "platform": "codex",
+            "display_name": "fixture",
+            "api_key": "sk-test",
+            "base_url": "https://anyrouter.top/v1",
+            "interface_format": "openai-responses",
+            "model_mappings_json": "[]"
+        });
+        let row = RouteCredentialService::create_api(&pool, serde_json::from_value(input).unwrap())
+            .await
+            .unwrap();
+        let config0: Value = serde_json::from_str(&row.config_json).unwrap();
+        assert!(config0.get("force_reasoning_content").is_none());
+
+        RouteCredentialService::enable_force_reasoning_content(&pool, &row.id)
+            .await
+            .unwrap();
+        let stored: Value = serde_json::from_str(
+            &RouteCredentialRepository::get(&pool, &row.id)
+                .await
+                .unwrap()
+                .config_json,
+        )
+        .unwrap();
+        assert_eq!(stored["force_reasoning_content"], true);
+
+        // 幂等：重复调用不报错，且既有 config 不被覆盖。
+        RouteCredentialService::enable_force_reasoning_content(&pool, &row.id)
+            .await
+            .unwrap();
+        let stored2: Value = serde_json::from_str(
+            &RouteCredentialRepository::get(&pool, &row.id)
+                .await
+                .unwrap()
+                .config_json,
+        )
+        .unwrap();
+        assert_eq!(stored2["force_reasoning_content"], true);
+        assert!(stored2["base_url"]
+            .as_str()
+            .unwrap()
+            .contains("anyrouter"));
     }
 }
 

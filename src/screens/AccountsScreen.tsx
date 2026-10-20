@@ -9284,7 +9284,7 @@ export function AccountsScreen({
                         <span className="grid gap-1">
                           <span>强制回传推理内容（Chat 中转）</span>
                           <span className="text-[11px] font-medium text-stone-500">
-                            仅当上游为思考模型（DeepSeek/MiMo 等）且报 reasoning_content 缺失（如 11155）时勾选，会在每次请求主动回传 reasoning_content。默认不勾选：碰到该报错会自动补齐并重试一次。
+                            仅当上游为思考模型（DeepSeek/MiMo 等）且报 reasoning_content 缺失（如 11155）时勾选，会在每次请求主动回传 reasoning_content。默认不勾选：第一次碰到该报错会自动补齐并重试一次，并直接帮本账号打开此开关，之后不再走报错重试。
                           </span>
                         </span>
                       </label>
@@ -10179,7 +10179,7 @@ export function AccountsScreen({
                       <span className="grid gap-1">
                         <span>强制回传推理内容（Chat 中转）</span>
                         <span className="text-[11px] font-medium text-stone-500">
-                          仅当上游为思考模型（DeepSeek/MiMo 等）且报 reasoning_content 缺失（如 11155）时勾选，会在每次请求主动回传 reasoning_content。默认不勾选：碰到该报错会自动补齐并重试一次。
+                          仅当上游为思考模型（DeepSeek/MiMo 等）且报 reasoning_content 缺失（如 11155）时勾选，会在每次请求主动回传 reasoning_content。默认不勾选：第一次碰到该报错会自动补齐并重试一次，并直接帮本账号打开此开关，之后不再走报错重试。
                         </span>
                       </span>
                     </label>

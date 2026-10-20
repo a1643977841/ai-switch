@@ -1,5 +1,6 @@
 use crate::database::repositories::route_credential_model_repository::RouteCredentialModelRepository;
 use crate::database::repositories::route_credential_repository::RouteCredentialRepository;
+use crate::services::route_credential_service::RouteCredentialService;
 use crate::database::repositories::route_pool_repository::RoutePoolRepository;
 use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
 use crate::error::{ApiError, AppError};
@@ -1357,7 +1358,15 @@ pub(crate) async fn forward_request(
         // (DeepSeek/MiMo behind new-api) reject a follow-up otherwise. Chat bridge
         // only: `reasoning_content` is a Chat-only field.
         let mut outbound_body = outbound_body;
-        if bridge_kind == Some(ProtocolBridgeKind::ResponsesToChat)
+        // `reasoning_content` is a Chat-only field, so the forced-reasoning rebuild
+        // only applies to bodies that are (or were bridged into) Chat: a true
+        // Chat/Completions passthrough (`None`), a Responses→Chat bridge, or a
+        // Claude→Chat bridge. The rewrite itself no-ops on non-Chat bodies.
+        let chat_bridge = matches!(
+            bridge_kind,
+            None | Some(ProtocolBridgeKind::ResponsesToChat) | Some(ProtocolBridgeKind::ClaudeToChat)
+        );
+        if chat_bridge
             && (reasoning_forced
                 || force_reasoning_content_enabled(
                     &parse_json_object(&credential.config_json, "config").unwrap_or(Value::Null),
@@ -1534,6 +1543,33 @@ pub(crate) async fn forward_request(
                             .filter(is_definitive_quota_exhaustion_failure)
                         {
                             break Some((format!("{}: {}", credential.display_name, failure.message), None));
+                        }
+                        // A 200 body that opens with a 11155 `reasoning_content`
+                        // rejection still reaches the client as a failure frame. Arm
+                        // the forced-reasoning rebuild so the upcoming same-account
+                        // retry (below) rebuilds the body with the field present, and
+                        // persist the account flag for later requests. Restricted to
+                        // Chat-body shapes, matching the buffered self-heal.
+                        if !reasoning_forced
+                            && matches!(
+                                bridge_kind,
+                                None
+                                    | Some(ProtocolBridgeKind::ResponsesToChat)
+                                    | Some(ProtocolBridgeKind::ClaudeToChat)
+                            )
+                            && detect_response_failed(&primed)
+                                .is_some_and(|failure| is_missing_reasoning_failure(&failure))
+                        {
+                            reasoning_forced = true;
+                            let heal_pool = pool.clone();
+                            let heal_id = credential.id.clone();
+                            tokio::spawn(async move {
+                                let _ = RouteCredentialService::enable_force_reasoning_content(
+                                    &heal_pool,
+                                    &heal_id,
+                                )
+                                .await;
+                            });
                         }
                         if !sse_payload_started(&primed) {
                             continue;
@@ -2044,13 +2080,28 @@ pub(crate) async fn forward_request(
         // supply. Arm the forced-reasoning rebuild and re-ask the *same* account
         // once. A second failure falls through to normal failover. The failure
         // policy's retry budget is untouched: this asks a different question.
-        if bridge_kind == Some(ProtocolBridgeKind::ResponsesToChat)
-            && !reasoning_forced
+        // Covers every Chat-body shape: a Responses→Chat bridge, a Claude→Chat
+        // bridge, and a direct Chat/Completions passthrough (`None`).
+        if matches!(
+            bridge_kind,
+            None | Some(ProtocolBridgeKind::ResponsesToChat) | Some(ProtocolBridgeKind::ClaudeToChat)
+        ) && !reasoning_forced
             && semantic_failure
                 .as_ref()
                 .is_some_and(is_missing_reasoning_failure)
         {
             reasoning_forced = true;
+            // Persist the account-level self-heal flag so the next request proactively
+            // carries `reasoning_content` and never hits 11155 again. Fire-and-forget:
+            // the in-flight retry above already answers this turn, so a slow or failed
+            // write must never block or fail it.
+            let heal_pool = pool.clone();
+            let heal_id = credential.id.clone();
+            tokio::spawn(async move {
+                let _ =
+                    RouteCredentialService::enable_force_reasoning_content(&heal_pool, &heal_id)
+                        .await;
+            });
             retry_queue.push_front((credential_index, credential_retry_count));
             continue;
         }
@@ -8394,6 +8445,10 @@ mod tests {
 
     mod official_codex_bridge {
         include!("route_proxy_service/official_codex_bridge_tests.rs");
+    }
+
+    mod reasoning_missing_selfheal {
+        include!("route_proxy_service/reasoning_missing_selfheal_tests.rs");
     }
 
     // The pre-mode signatures: these assertions are about the aggregated list.
