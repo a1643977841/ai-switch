@@ -164,6 +164,14 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # 缓存 Rust 编译产物（registry + target/）：首次全量编译后，后续发布仅重编改动部分。
+      # key 按 matrix.os 隔离，避免 4 个平台 job 互相覆盖彼此的 target 缓存（rust-cache 默认键不含 OS）。
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri"
+          key: ${{ matrix.os }}
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
