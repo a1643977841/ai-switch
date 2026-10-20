@@ -360,13 +360,42 @@ Once the cooldown expires the badge disappears on its own and there is nothing l
 
 The edit drawer's 故障处理 ("failure handling") tab has a 模型状态 ("model status") section listing every known model — including ones that have never failed, so a healthy model can be paused pre-emptively. Each row carries two actions: a 暂停 / 恢复 ("pause" / "resume") toggle, and 解除 ("clear") to drop that model's cooldown and error state. The section header's 全部解除 ("clear all") only issues requests for models that actually have something to clear: it skips `paused` ones (that is the user's own decision) and skips healthy models with no cooldown and no failure counts.
 
-### The sensitive-word reminder
+### Sensitive-content rejection reminder
 
-When `sensitive_words_detected` shows up in `last_failure_response_json` or `last_failure_message`, the status tag's hover panel gains one extra line:
+When `last_failure_response_json` or `last_failure_message` contains
+`sensitive_words_detected` or `content-blocked`, the status tag's hover panel gains
+the existing keyword-filter reminder and classifies the failure as `content_rejected`:
 
 > 友情提醒：当前中转站似乎对项目存在关键词检测，您的项目可能存在敏感词，也不排除是中转站误判。 ("Heads-up: this relay appears to run keyword detection against your project. Your project may contain a flagged word, though a relay false positive is also possible.")
 
-This class of error comes from the relay's own keyword filter, not from a broken account. When you see the reminder, check your prompts and code for trigger words, or try another relay to see whether it was a false positive.
+A content rejection does not mean the credential is unhealthy. ai-switch does not
+resend the identical request to the same account, does not increase the failure
+count, does not start a cooldown, and does not change the account status. In
+aggregate mode with failover enabled, the existing candidate queue naturally moves
+to the next account. Precise mode and accounts with failover disabled do not switch.
+
+When **Content-filter compatibility** is enabled on the account's Advanced tab,
+ai-switch waits until the first candidate pass is exhausted, then omits older tool
+outputs and retries once:
+
+- the latest six tool outputs are preserved; only older plain-text outputs larger
+  than 128 bytes are replaced;
+- user messages, system prompts, tool definitions, tool arguments, `call_id`, and
+  reasoning are never modified;
+- images, files, and other non-text structures are left untouched;
+- the second pass only targets accounts that both rejected the content and enabled
+  the option, and there is never a third pass;
+- local conversation storage is unchanged, so the next client request starts from
+  the original history.
+
+The option is account-scoped because upstream word lists differ. If the trigger is
+inside the latest six tool outputs, a user message, or system instructions, B1 cannot
+help and the upstream's original rejection is returned.
+
+**Brotli, Gzip, and Zstd request compression do not solve this problem.** New API
+gateways decompress the request first, then scan the combined messages,
+instructions, tools, and tool outputs. The same request is rejected with or without
+Brotli in live tests.
 
 ### The exhausted-budget-pool reminder
 
@@ -406,6 +435,7 @@ The phrase is looked for in both the stored body and `last_failure_message`, cas
 | `semantic_response_failed` | Semantic failure, taking the fingerprint-streak route (the quota-exhaustion and missing-scope channel) | Account |
 | `model_test_status` | A model test received a non-2xx status | Account on 401/403, model otherwise |
 | `model_test` | Any other retryable model-test failure (transport level) | Account |
+| `content_rejected` | The upstream rejected the request under a content policy; this only records a hint and does not change retry count, cooldown, or account status | Neither account nor model health |
 
 The same label can appear in both the account-level and the model-level `last_failure_kind`: the account level records "this account's most recent failure", the model level "this model's most recent failure".
 

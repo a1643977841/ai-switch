@@ -366,11 +366,32 @@ let cooldown_seconds = policy.cooldown_enabled.then_some(policy.cooldown_seconds
 
 ### 敏感词检测提醒
 
-如果 `last_failure_response_json` 或 `last_failure_message` 里出现 `sensitive_words_detected` 这个错误码，状态标签的悬停提示里会多出一条友情提醒：
+如果 `last_failure_response_json` 或 `last_failure_message` 里出现
+`sensitive_words_detected` 或 `content-blocked`，状态标签的悬停提示里会多出一条友情提醒：
 
 > 友情提醒：当前中转站似乎对项目存在关键词检测，您的项目可能存在敏感词，也不排除是中转站误判。
 
-这类错误来自中转站自己的关键词过滤，不是账号坏了。看到提醒可以先检查提示词与代码里有没有触发词，也可以换一个中转站验证是否误判。
+这类错误来自中转站自己的内容过滤，不是账号坏了。ai-switch 会把它标成
+`content_rejected`：不会在同一个账号上重复发送同一份请求，不会增加失败次数，
+不会冷却账号，也不会改账号状态。聚合模式且故障转移开启时，请求会自然尝试池里的
+下一个账号；精确模式或关闭故障转移时不会换号。
+
+如果账号在编辑抽屉的高级页开启「内容过滤兼容」，第一轮候选全部结束后，
+ai-switch 会省略较早的工具输出并重试一次：
+
+- 保留最新 6 条工具输出，只替换更早的、正文超过 128 字节的纯文本输出；
+- 不改用户消息、系统提示、工具定义、工具参数、`call_id` 或 reasoning；
+- 图片、文件和其它非文本结构不处理；
+- 只重试第一轮中“被内容过滤拒绝且开启该开关”的账号，最多一次；
+- 不改本地会话记录，下一次客户端请求仍会发送原始历史。
+
+开关是账号级的，因为不同中转站的词表与兼容行为不同。触发词如果就在最新 6 条
+工具输出、用户消息或系统提示里，裁剪旧工具输出不会解决问题，ai-switch 会保留
+上游的原始拒绝响应。
+
+**Brotli、Gzip、Zstd 请求压缩不能解决这个问题。** New API 系中转站会先解压
+请求，再对合并后的消息、instructions、tools 与工具输出做关键词扫描；实测同一份
+含触发词的请求无论明文还是 Brotli 都返回 `sensitive_words_detected`。
 
 ### 公共池额度耗尽提醒
 
@@ -410,6 +431,7 @@ let cooldown_seconds = policy.cooldown_enabled.then_some(policy.cooldown_seconds
 | `semantic_response_failed` | 语义失败（走指纹连击那条路时，即配额耗尽与权限不足通道） | 账号 |
 | `model_test_status` | 模型测试收到非 2xx 状态码 | 401/403 归账号，其余归模型 |
 | `model_test` | 模型测试的其他可重试失败（传输层） | 账号 |
+| `content_rejected` | 上游按内容策略拒绝请求；只写提示，不增加失败次数、不冷却、不改账号状态 | 不归账号或模型健康 |
 
 同一个标签会同时出现在账号级与模型级的 `last_failure_kind` 上：账号级记的是"这个账号最近一次失败"，模型级记的是"这个模型最近一次失败"。
 
