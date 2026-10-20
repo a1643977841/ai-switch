@@ -155,6 +155,13 @@ impl RouteCredentialService {
                 .map(|mode| json!(mode))
                 .as_ref(),
         )?;
+        crate::services::request_content_rejection::validate(
+            input
+                .content_rejection_compat
+                .as_ref()
+                .map(|mode| json!(mode))
+                .as_ref(),
+        )?;
         validate_model_mappings(&input.model_mappings_json)?;
         let fetched_models = parse_fetched_models_json(input.fetched_models_json.as_deref())?;
         let api_key_field =
@@ -194,6 +201,13 @@ impl RouteCredentialService {
         }
         if let Some(mode) = input.request_brotli_compression {
             config[crate::services::request_compression::CONFIG_KEY] = json!(mode);
+        }
+        if let Some(mode) = input
+            .content_rejection_compat
+            .as_deref()
+            .filter(|mode| *mode != "off")
+        {
+            config[crate::services::request_content_rejection::CONFIG_KEY] = json!(mode);
         }
         // Omitted rather than written as `false`, so an account that never opts in
         // carries no trace of the feature in its config.
@@ -320,6 +334,9 @@ impl RouteCredentialService {
             )?;
             crate::services::request_compression::validate(
                 config.get(crate::services::request_compression::CONFIG_KEY),
+            )?;
+            crate::services::request_content_rejection::validate(
+                config.get(crate::services::request_content_rejection::CONFIG_KEY),
             )?;
         }
         let mut input = input;
@@ -1809,6 +1826,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -1855,6 +1873,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -1904,6 +1923,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -1990,6 +2010,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: Some("shared-client/1.0".into()),
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2078,6 +2099,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2132,6 +2154,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2184,6 +2207,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2237,6 +2261,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2287,6 +2312,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: Some("new_api".into()),
                 relay_balance_access_token: Some("pat-panel-token".into()),
@@ -2411,6 +2437,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2465,6 +2492,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2571,6 +2599,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2613,6 +2642,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2655,6 +2685,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: Some("  MyGrokClient/9.9.9  ".into()),
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2697,6 +2728,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: Some("   ".into()),
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
@@ -2833,6 +2865,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: Some("new_api".into()),
                 relay_balance_access_token: None,
@@ -2878,6 +2911,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: Some("new_api".into()),
                 relay_balance_access_token: Some("  pat-panel-token  ".into()),
@@ -2928,6 +2962,7 @@ mod tests {
                     responses_encrypted_content_cleanup: None,
                     responses_encrypted_content_aggressive_strip: None,
                     force_reasoning_content: None,
+                    content_rejection_compat: None,
                     user_agent: None,
                     relay_balance_provider: Some("new_api".into()),
                     relay_balance_access_token: token.clone(),
@@ -2973,6 +3008,7 @@ mod tests {
                     responses_encrypted_content_cleanup: None,
                     responses_encrypted_content_aggressive_strip: None,
                     force_reasoning_content: None,
+                    content_rejection_compat: None,
                     user_agent: None,
                     relay_balance_provider: provider.clone(),
                     relay_balance_access_token: None,
@@ -3017,6 +3053,7 @@ mod tests {
                     responses_encrypted_content_cleanup: None,
                     responses_encrypted_content_aggressive_strip: None,
                     force_reasoning_content: None,
+                    content_rejection_compat: None,
                     user_agent: None,
                     relay_balance_provider: Some(provider.into()),
                     relay_balance_access_token: None,
@@ -3427,5 +3464,143 @@ mod request_compression_setting_tests {
                 .config_json,
             changed.config_json
         );
+    }
+}
+
+
+#[cfg(test)]
+mod content_rejection_setting_tests {
+    use super::*;
+    use crate::database::{create_memory_pool, run_migrations};
+
+    fn input(mode: Option<&str>) -> Value {
+        let mut input = json!({
+            "platform":"codex",
+            "display_name":"Content rejection fixture",
+            "api_key":"sk-test",
+            "base_url":"https://example.com/v1",
+            "interface_format":"openai",
+            "model_mappings_json":"[]"
+        });
+        if let Some(mode) = mode {
+            input["content_rejection_compat"] = json!(mode);
+        }
+        input
+    }
+
+    #[tokio::test]
+    async fn content_rejection_compat_is_written_only_when_enabled() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        for (mode, expected) in [
+            (None, None),
+            (Some("off"), None),
+            (Some("trim_old_tool_outputs"), Some("trim_old_tool_outputs")),
+        ] {
+            let row = RouteCredentialService::create_api(
+                &pool,
+                serde_json::from_value(input(mode)).unwrap(),
+            )
+            .await
+            .unwrap();
+            let config: Value = serde_json::from_str(&row.config_json).unwrap();
+            assert_eq!(
+                config
+                    .get(crate::services::request_content_rejection::CONFIG_KEY)
+                    .and_then(Value::as_str),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_content_rejection_compat_creation_is_rejected_before_persistence() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let error = RouteCredentialService::create_api(
+            &pool,
+            serde_json::from_value(input(Some("trim_all"))).unwrap(),
+        )
+        .await
+        .expect_err("invalid mode");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "validation.content_rejection_compat",
+                ..
+            }
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_credentials")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_content_rejection_compat_update_preserves_saved_value() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let row = RouteCredentialService::create_api(
+            &pool,
+            serde_json::from_value(input(Some("trim_old_tool_outputs"))).unwrap(),
+        )
+        .await
+        .unwrap();
+        let invalid = json!({
+            "display_name": row.display_name,
+            "email": row.email,
+            "status": row.status,
+            "route_priority": row.route_priority,
+            "max_concurrency": row.max_concurrency,
+            "secret_payload_json": row.secret_payload_json,
+            "config_json": r#"{"content_rejection_compat":"trim_all","keep":"yes"}"#,
+            "preview_json": row.preview_json
+        });
+        assert!(RouteCredentialService::update(
+            &pool,
+            row.id.clone(),
+            serde_json::from_value(invalid).unwrap()
+        )
+        .await
+        .is_err());
+        let stored = RouteCredentialRepository::get(&pool, &row.id).await.unwrap();
+        let config: Value = serde_json::from_str(&stored.config_json).unwrap();
+        assert_eq!(
+            config["content_rejection_compat"],
+            "trim_old_tool_outputs"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_the_setting_off_removes_it_from_config() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let row = RouteCredentialService::create_api(
+            &pool,
+            serde_json::from_value(input(Some("trim_old_tool_outputs"))).unwrap(),
+        )
+        .await
+        .unwrap();
+        let update = json!({
+            "display_name": row.display_name,
+            "email": row.email,
+            "status": row.status,
+            "route_priority": row.route_priority,
+            "max_concurrency": row.max_concurrency,
+            "secret_payload_json": row.secret_payload_json,
+            "config_json": r#"{"keep":"yes"}"#,
+            "preview_json": row.preview_json
+        });
+        let updated = RouteCredentialService::update(
+            &pool,
+            row.id,
+            serde_json::from_value(update).unwrap(),
+        )
+        .await
+        .unwrap();
+        let config: Value = serde_json::from_str(&updated.config_json).unwrap();
+        assert!(config.get("content_rejection_compat").is_none());
+        assert_eq!(config["keep"], "yes");
     }
 }

@@ -252,6 +252,10 @@ pub struct CreateApiRouteCredentialInput {
     /// request instead of waiting to be told it is missing.治 11155.
     #[serde(default)]
     pub force_reasoning_content: Option<bool>,
+    /// 账号级内容过滤兼容。只允许 `trim_old_tool_outputs`；缺失或 `off`
+    /// 表示关闭，编辑时由客户端删除该键。
+    #[serde(default)]
+    pub content_rejection_compat: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
     /// Which relay panel dialect the account's balance is read with. Only the

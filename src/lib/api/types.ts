@@ -358,6 +358,7 @@ export type CreateApiRouteCredentialInput = {
   request_brotli_compression?: "auto" | "on" | "off" | null;
   responses_encrypted_content_cleanup?: boolean | null;
   force_reasoning_content?: boolean | null;
+  content_rejection_compat?: "trim_old_tool_outputs" | "off" | null;
   user_agent?: string | null;
   relay_balance_provider?: RelayBalanceProvider | null;
   /** Relay panel account access token, stored beside the api_key in the secret. */

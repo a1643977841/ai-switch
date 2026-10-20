@@ -1247,6 +1247,7 @@ mod tests {
                 responses_encrypted_content_cleanup: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
+                content_rejection_compat: None,
                 user_agent: None,
                 relay_balance_provider: None,
                 relay_balance_access_token: None,
