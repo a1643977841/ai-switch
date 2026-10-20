@@ -1467,11 +1467,19 @@ fn ensure_tool_call_reasoning(messages: &mut [Value]) {
 }
 
 /// Guarantee that *every* assistant message in a converted Chat request carries
-/// a non-empty `reasoning_content`, inserting the neutral placeholder when the
-/// real reasoning is gone. This is the no-tool-turn counterpart to
+/// a non-empty `reasoning_content`. When the client already round-trips the
+/// thinking text under the `reasoning` extension, that text is copied back
+/// verbatim; only when the real reasoning is gone does the neutral placeholder
+/// step in. This is the no-tool-turn counterpart to
 /// [`ensure_tool_call_reasoning`]: some thinking upstreams (DeepSeek/MiMo behind
 /// new-api) reject a follow-up with `reasoning_content_missing` / code 11155
 /// whenever a prior *plain* assistant turn lacks the field.
+///
+/// DeepSeek's contract is stricter than "the field exists" once the request
+/// carries tools: every replayed turn must return the *original* reasoning. A
+/// placeholder satisfies lenient relays but the strict routes still answer 400
+/// with the same 11155 sentence, so real text has to win whenever it is
+/// available.
 ///
 /// Applied only when the account opted in (`force_reasoning_content`) or after
 /// the upstream actually returned that error (self-heal), so upstreams that do
@@ -1495,9 +1503,16 @@ pub(crate) fn force_reasoning_content_on_chat_body(body: &[u8]) -> Option<Vec<u8
         if has_reasoning {
             continue;
         }
+        let client_reasoning = object
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string);
         object.insert(
             "reasoning_content".to_string(),
-            Value::String(TOOL_CALL_REASONING_PLACEHOLDER.to_string()),
+            Value::String(
+                client_reasoning.unwrap_or_else(|| TOOL_CALL_REASONING_PLACEHOLDER.to_string()),
+            ),
         );
         changed = true;
     }
@@ -2292,6 +2307,48 @@ mod tests {
             messages[4]["reasoning_content"].as_str(),
             Some("kept"),
             "real reasoning preserved",
+        );
+    }
+
+    #[test]
+    fn force_reasoning_reuses_client_reasoning_before_falling_back() {
+        // Some clients round-trip the thinking text under the `reasoning`
+        // extension instead of `reasoning_content`. DeepSeek wants the original
+        // text back once tools are present; a placeholder only satisfies lenient
+        // relays, so real reasoning must win over the placeholder.
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "a", "reasoning": "Let me read the file."},
+                {"role": "user", "content": "again"},
+                {"role": "assistant", "content": "b", "reasoning": ""},
+                {"role": "assistant", "content": "c", "reasoning_content": ""},
+                {"role": "assistant", "content": "d", "reasoning_content": "kept"}
+            ]
+        });
+        let forced = force_reasoning_content_on_chat_body(body.to_string().as_bytes())
+            .expect("turns without reasoning_content were present");
+        let value: Value = serde_json::from_slice(&forced).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[1]["reasoning_content"].as_str(),
+            Some("Let me read the file."),
+            "client reasoning must be passed back verbatim",
+        );
+        assert_eq!(
+            messages[3]["reasoning_content"].as_str(),
+            Some(TOOL_CALL_REASONING_PLACEHOLDER),
+            "blank reasoning still needs the placeholder",
+        );
+        assert_eq!(
+            messages[4]["reasoning_content"].as_str(),
+            Some(TOOL_CALL_REASONING_PLACEHOLDER),
+            "empty reasoning_content without reasoning falls back",
+        );
+        assert_eq!(
+            messages[5]["reasoning_content"].as_str(),
+            Some("kept"),
+            "an existing reasoning_content must not be replaced",
         );
     }
 

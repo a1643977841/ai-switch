@@ -65,7 +65,9 @@ use crate::services::route_proxy_live_log::{
     stage_preview, truncated_stage_names, RouteProxyLiveLog, RouteProxyLiveLogEntry,
     LIVE_LOG_ELISION_MARKER, LIVE_LOG_RAW_PREVIEW_LIMIT, LIVE_LOG_STAGE_LIMIT,
 };
-use crate::services::route_proxy_stream::{sse_payload_started, StreamObserver};
+use crate::services::route_proxy_stream::{
+    sse_is_chat_role_prelude, sse_payload_started, StreamObserver,
+};
 use crate::services::route_stream_continuation::plan_continuation;
 use axum::body::Body;
 use axum::extract::State as AxumState;
@@ -1596,6 +1598,15 @@ pub(crate) async fn forward_request(
                             });
                         }
                         if !sse_payload_started(&primed) {
+                            continue;
+                        }
+                        // A Chat upstream often opens with a content-less
+                        // `role: assistant` chunk and only then sends either the
+                        // first token or a failure frame. Committing on that
+                        // announcement would hand the client a 200 before the
+                        // failure is known, so keep priming until real output
+                        // (or an error) arrives.
+                        if sse_is_chat_role_prelude(&primed) {
                             continue;
                         }
                         // A gateway that reports failure in a 200 body usually

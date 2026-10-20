@@ -79,6 +79,68 @@ async fn start_heal_upstream(
     (base, fixture)
 }
 
+/// Like [`start_heal_upstream`], but writes each response as separate chunks
+/// with a pause between them, so the proxy's priming loop sees the frames one
+/// read at a time. A single buffered body can land in one read and hide the
+/// "role announcement first, failure second" sequence this fixture exists for.
+async fn start_chunked_heal_upstream(
+    responses: Vec<(StatusCode, HeaderMap, Vec<String>)>,
+) -> (String, HealFixture) {
+    let requests: ReqLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let responses = Arc::new(responses);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().fallback(move |body: axum::body::Bytes| {
+                let recorded = recorded.clone();
+                let responses = responses.clone();
+                async move {
+                    let index = {
+                        let mut guard = recorded.lock().unwrap();
+                        let index = guard.len();
+                        let parsed =
+                            serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+                        guard.push(parsed);
+                        index
+                    };
+                    let (status, headers, chunks) = responses
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| responses.last().cloned().unwrap());
+                    let stream = futures_util::stream::unfold(
+                        chunks.into_iter(),
+                        |mut chunks| async move {
+                            let chunk = chunks.next()?;
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            Some((
+                                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk)),
+                                chunks,
+                            ))
+                        },
+                    );
+                    let mut builder = Response::builder().status(status);
+                    for (k, v) in headers.iter() {
+                        builder = builder.header(k, v);
+                    }
+                    builder.body(Body::from_stream(stream)).unwrap()
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    });
+    let fixture = HealFixture {
+        requests,
+        _server: server,
+        pool: create_memory_pool().await.unwrap(),
+        credential_id: String::new(),
+    };
+    (base, fixture)
+}
+
 async fn wait_for_force_flag(pool: &SqlitePool, id: &str) -> bool {
     for _ in 0..100 {
         let cred = RouteCredentialRepository::get(pool, id).await.unwrap();
@@ -102,6 +164,15 @@ fn sse(content_type: &str, body: &str) -> (StatusCode, HeaderMap, String) {
         HeaderValue::from_str(content_type).unwrap(),
     );
     (StatusCode::OK, headers, body.to_string())
+}
+
+fn sse_chunks(content_type: &str, chunks: Vec<String>) -> (StatusCode, HeaderMap, Vec<String>) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_str(content_type).unwrap(),
+    );
+    (StatusCode::OK, headers, chunks)
 }
 
 /// Anthropic → Chat bridge, non-streaming. The gateway rejects the first turn
@@ -307,6 +378,116 @@ async fn chat_passthrough_prime_missing_reasoning_self_heal() {
         second.to_string().contains("reasoning_content")
             && second.to_string().contains("tool call"),
         "healed stream request must carry reasoning_content on the assistant turn: {second}"
+    );
+    drop(recorded);
+
+    assert!(
+        wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
+        "account self-heal flag must be persisted"
+    );
+}
+
+/// The shape the real gateway actually sends: a content-less `role: assistant`
+/// chunk first, the 11155 failure second. The prime window must not close on the
+/// role announcement, or the error arrives after the client already has a 200
+/// and neither the self-heal nor the retry ever runs. The healed body must also
+/// carry the client's own `reasoning` text, not the placeholder — strict
+/// thinking routes reject a fabricated one.
+#[tokio::test]
+async fn chat_passthrough_role_prelude_then_missing_reasoning_self_heal() {
+    let role_prelude = "data: {\"id\":\"c0\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+    let err_frame = "data: {\"error\":{\"message\":\"Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API.\",\"type\":\"server_error\"}}\n\n";
+    let ok_stream =
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"healed\"}}]}\n\ndata: [DONE]\n\n";
+    let (base, mut fixture) = start_chunked_heal_upstream(vec![
+        sse_chunks(
+            "text/event-stream",
+            vec![role_prelude.to_string(), err_frame.to_string()],
+        ),
+        sse_chunks("text/event-stream", vec![ok_stream.to_string()]),
+    ])
+    .await;
+
+    run_migrations(&fixture.pool).await.unwrap();
+    let config = json!({
+        "base_url": base,
+        "interface_format": "openai",
+        "model_mappings": [{"from":"gpt-5","to":"gpt-5"}],
+        "failure_policy": {"retry_count": 1}
+    });
+    let credential = RouteCredentialRepository::create(
+        &fixture.pool,
+        "claude",
+        "api",
+        "chat-prelude-heal",
+        None,
+        "ok",
+        None,
+        r#"{"api_key":"sk-upstream"}"#,
+        &config.to_string(),
+        "{}",
+    )
+    .await
+    .unwrap();
+    fixture.credential_id = credential.id.clone();
+    RoutePoolRepository::replace_members(&fixture.pool, "claude", &[credential.id.clone()])
+        .await
+        .unwrap();
+    let route_key = RouteProxyKeyRepository::ensure_platform_key(
+        &fixture.pool,
+        "claude",
+        "sk-test-chat-prelude-heal",
+    )
+    .await
+    .unwrap();
+    let runtime = RouteProxyRuntimeState::default();
+    let state = build_proxy_state(fixture.pool.clone(), &runtime);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+    );
+    let body = json!({
+        "model":"gpt-5",
+        "stream":true,
+        "messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"prior answer","reasoning":"Let me read the file."}
+        ]
+    })
+    .to_string();
+    let response = proxy_handler(
+        AxumState(state),
+        Method::POST,
+        headers,
+        "/v1/chat/completions".parse().unwrap(),
+        Body::from(body),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "self-heal should recover after a role-prelude rejection"
+    );
+
+    let recorded = fixture.requests.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "the role announcement must not commit the stream before the failure frame: {recorded:?}"
+    );
+    let first = recorded.first().expect("first upstream request");
+    assert!(
+        !first.to_string().contains("reasoning_content"),
+        "pre-heal request must not carry reasoning_content: {first}"
+    );
+    let second = recorded.get(1).expect("second upstream request");
+    assert_eq!(
+        second.pointer("/messages/1/reasoning_content"),
+        Some(&Value::String("Let me read the file.".to_string())),
+        "healed request must replay the client's own reasoning, not a placeholder: {second}"
     );
     drop(recorded);
 

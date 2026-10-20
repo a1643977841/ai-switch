@@ -159,9 +159,76 @@ pub fn sse_payload_started(bytes: &[u8]) -> bool {
     })
 }
 
+/// Whether every data frame buffered so far is a Chat role announcement that
+/// still carries no model output.
+///
+/// Several gateways open a 200 SSE stream with a content-less chunk
+/// (`delta: {"role": "assistant", "content": ""}`) and only then emit either the
+/// first real token or a failure frame. Committing the stream on that
+/// announcement spends the last moment a retry is still possible, which is how
+/// a rejection sitting in frame two reaches the client as a broken answer.
+///
+/// Only a payload made entirely of Chat chunks with empty deltas counts.
+/// Responses events, errors, malformed JSON, usage-only chunks and anything
+/// carrying content/reasoning/tool calls all return `false`, so callers that
+/// hold the stream back never widen the window beyond the shape understood
+/// here.
+pub fn sse_is_chat_role_prelude(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut saw_payload = false;
+    for line in text.lines() {
+        let Some(data) = line.trim_start().strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        saw_payload = true;
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return false;
+        };
+        if value.get("error").is_some() {
+            return false;
+        }
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            return false;
+        };
+        if choices.is_empty() {
+            return false;
+        }
+        for choice in choices {
+            if choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                return false;
+            }
+            let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
+                return false;
+            };
+            for (key, value) in delta {
+                if key == "role" {
+                    continue;
+                }
+                let empty = match value {
+                    Value::Null => true,
+                    Value::String(text) => text.is_empty(),
+                    Value::Array(items) => items.is_empty(),
+                    Value::Object(object) => object.is_empty(),
+                    Value::Number(_) | Value::Bool(_) => false,
+                };
+                if !empty {
+                    return false;
+                }
+            }
+        }
+    }
+    saw_payload
+}
+
 #[cfg(test)]
 mod payload_started_tests {
-    use super::sse_payload_started;
+    use super::{sse_is_chat_role_prelude, sse_payload_started};
 
     /// The shape that made this rule necessary: a gateway parks the client on
     /// comment frames, then reports the failure. Nothing was delivered, so the
@@ -196,6 +263,41 @@ mod payload_started_tests {
         assert!(sse_payload_started(
             b"data: {\"type\":\"response.created\"}"
         ));
+    }
+
+    #[test]
+    fn chat_role_announcements_are_a_prelude() {
+        let role_only = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
+        let empty_content = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+        assert!(sse_is_chat_role_prelude(role_only.as_bytes()));
+        assert!(sse_is_chat_role_prelude(empty_content.as_bytes()));
+        assert!(sse_is_chat_role_prelude(
+            format!(": ping\n\n{empty_content}").as_bytes()
+        ));
+    }
+
+    #[test]
+    fn real_chat_output_ends_the_prelude() {
+        let content = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+        let reasoning = "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"thinking\"},\"finish_reason\":null}]}\n\n";
+        let tool_call = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0}]},\"finish_reason\":null}]}\n\n";
+        let finished = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        assert!(!sse_is_chat_role_prelude(content.as_bytes()));
+        assert!(!sse_is_chat_role_prelude(reasoning.as_bytes()));
+        assert!(!sse_is_chat_role_prelude(tool_call.as_bytes()));
+        assert!(!sse_is_chat_role_prelude(finished.as_bytes()));
+    }
+
+    #[test]
+    fn errors_and_foreign_shapes_are_never_held_back() {
+        let error = "data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n";
+        let responses = "data: {\"type\":\"response.created\"}\n\n";
+        let usage_only = "data: {\"choices\":[],\"usage\":{\"total_tokens\":1}}\n\n";
+        assert!(!sse_is_chat_role_prelude(error.as_bytes()));
+        assert!(!sse_is_chat_role_prelude(responses.as_bytes()));
+        assert!(!sse_is_chat_role_prelude(usage_only.as_bytes()));
+        assert!(!sse_is_chat_role_prelude(b"data: [DONE]\n\n"));
+        assert!(!sse_is_chat_role_prelude(b""));
     }
 }
 
