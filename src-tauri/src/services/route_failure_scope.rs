@@ -14,6 +14,9 @@ pub(crate) fn is_account_scoped_failure(kind: &str, status: Option<u16>) -> bool
         "upstream_status" | "model_test_status" => matches!(status, Some(401) | Some(403)),
         // The upstream answered about this specific model.
         "semantic_response_transient" | "response_transform" => false,
+        // A content-policy rejection is about this request body, never the
+        // credential. It must not park the account if a future caller records it.
+        "content_rejected" => false,
         // Unknown kinds park the account: over-parking is recoverable, letting a
         // broken credential keep serving is not.
         _ => true,
@@ -64,6 +67,12 @@ mod tests {
             assert!(!is_account_scoped_failure(kind, Some(200)));
             assert!(!is_account_scoped_failure(kind, None));
         }
+    }
+
+    #[test]
+    fn content_rejections_do_not_park_the_account() {
+        assert!(!is_account_scoped_failure("content_rejected", Some(500)));
+        assert!(!is_account_scoped_failure("content_rejected", None));
     }
 
     #[test]

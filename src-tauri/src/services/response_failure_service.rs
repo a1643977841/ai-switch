@@ -10,6 +10,21 @@ pub struct SemanticResponseFailure {
     pub message: String,
 }
 
+const CONTENT_REJECTION_CODES: &[&str] = &["sensitive_words_detected", "content-blocked"];
+
+/// Whether the upstream explicitly rejected the request body by its content
+/// policy. Match the complete structured code only: the same phrase can appear
+/// in ordinary prose, while a gateway's `upstream_status` code is not evidence
+/// that content was filtered.
+pub(crate) fn is_content_rejection(failure: &SemanticResponseFailure) -> bool {
+    failure.code.as_deref().is_some_and(|code| {
+        let code = code.trim();
+        CONTENT_REJECTION_CODES
+            .iter()
+            .any(|known| code.eq_ignore_ascii_case(known))
+    })
+}
+
 /// Returns whether a semantic response failure is a temporary upstream
 /// capacity issue rather than an account-specific failure.
 pub fn is_transient_response_failure(message: &str) -> bool {
@@ -615,6 +630,38 @@ mod tests {
         let body = br#"{"type":"response.failed","response":{"status":"failed","error":{"message":"maintenance"}}}"#;
         assert_eq!(detect_response_failed(body).unwrap().message, "maintenance");
         assert!(detect_response_failed(br#"{"response":{"status":"failed"}}"#).is_some());
+    }
+
+    #[test]
+    fn recognizes_content_rejection_codes_as_complete_case_insensitive_values() {
+        for code in ["sensitive_words_detected", "CONTENT-BLOCKED"] {
+            let failure = SemanticResponseFailure {
+                code: Some(code.to_string()),
+                error_type: Some("new_api_error".to_string()),
+                message: "opaque upstream text".to_string(),
+            };
+            assert!(is_content_rejection(&failure), "{code}");
+        }
+
+        for failure in [
+            SemanticResponseFailure {
+                code: Some("sensitive_words_detected_extra".to_string()),
+                error_type: None,
+                message: "sensitive_words_detected".to_string(),
+            },
+            SemanticResponseFailure {
+                code: Some("upstream_status".to_string()),
+                error_type: None,
+                message: "content-blocked".to_string(),
+            },
+            SemanticResponseFailure {
+                code: None,
+                error_type: None,
+                message: "sensitive words detected".to_string(),
+            },
+        ] {
+            assert!(!is_content_rejection(&failure));
+        }
     }
 
     #[test]
