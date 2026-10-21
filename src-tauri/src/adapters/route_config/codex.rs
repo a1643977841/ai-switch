@@ -106,6 +106,9 @@ fn apply_managed_config(
     path: &Path,
     input: &RouteConfigInput,
 ) -> Result<(), AppError> {
+    if input.codex_keep_login_state {
+        require_chatgpt_login(path)?;
+    }
     document["model_provider"] = value("ai-switch");
     document["model_catalog_json"] = value(CODEX_MODEL_CATALOG_FILENAME);
     // Resolve both values before touching the document: `existing_model` borrows
@@ -174,6 +177,91 @@ fn apply_managed_config(
     Ok(())
 }
 
+/// Why a Codex `auth.json` cannot back `requires_openai_auth`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexLoginState {
+    /// A ChatGPT login is present and usable.
+    Chatgpt,
+    /// No `auth.json` at all — `codex login` never ran.
+    Missing,
+    /// File exists but cannot be read or parsed.
+    Unreadable(String),
+    /// `apikey`-mode (only `OPENAI_API_KEY`) or otherwise token-less.
+    NotChatgpt { auth_mode: String },
+}
+
+/// Reads the Codex login state from the `auth.json` next to `config.toml`.
+///
+/// Shared by the write path (which refuses to produce a provider that cannot
+/// authenticate) and the settings UI (which warns before the user even tries).
+pub fn inspect_codex_login_state(config_path: &Path) -> CodexLoginState {
+    let auth_path = config_path
+        .parent()
+        .map(|dir| dir.join("auth.json"))
+        .unwrap_or_else(|| PathBuf::from("auth.json"));
+    let raw = match std::fs::read_to_string(&auth_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return CodexLoginState::Missing,
+        Err(err) => return CodexLoginState::Unreadable(format!("{}: {err}", auth_path.display())),
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return CodexLoginState::Unreadable(format!("{}: not valid JSON", auth_path.display()));
+    };
+
+    let has_token = parsed
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|token| !token.is_empty());
+    if has_token {
+        return CodexLoginState::Chatgpt;
+    }
+    CodexLoginState::NotChatgpt {
+        auth_mode: parsed
+            .get("auth_mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+    }
+}
+
+/// Refuses to write a login-backed provider unless a ChatGPT login actually
+/// exists beside `config.toml`.
+///
+/// `requires_openai_auth` makes Codex read its credential from `auth.json`. An
+/// `apikey`-mode file (just `OPENAI_API_KEY`) has no ChatGPT tokens, so the
+/// written config would look correct and fail on every request — the client
+/// starts, the provider is selected, and nothing can authenticate. Rotating a
+/// ChatGPT login, or exiting direct mode (which writes `apikey` back), both
+/// produce exactly that state, so it is a realistic one and not worth a silent
+/// failure.
+///
+/// Failing the write is the honest outcome: the user sees why, and the previous
+/// working config stays on disk instead of being replaced by a broken one.
+fn require_chatgpt_login(config_path: &Path) -> Result<(), AppError> {
+    let refuse = |code: &'static str, details: String| AppError::Validation {
+        code,
+        message: "Keeping the Codex login state needs a signed-in Codex account".to_string(),
+        details: Some(details),
+        recoverable: true,
+    };
+    match inspect_codex_login_state(config_path) {
+        CodexLoginState::Chatgpt => Ok(()),
+        CodexLoginState::Missing => Err(refuse(
+            "config.codex_login_missing",
+            "auth.json does not exist; run `codex login` first".to_string(),
+        )),
+        CodexLoginState::Unreadable(details) => {
+            Err(refuse("config.codex_login_unreadable", details))
+        }
+        CodexLoginState::NotChatgpt { auth_mode } => Err(refuse(
+            "config.codex_login_not_chatgpt",
+            format!("auth.json has no ChatGPT tokens (auth_mode = {auth_mode}); run `codex login` first"),
+        )),
+    }
+}
+
 /// Writes the provider's identity and authentication fields.
 ///
 /// Two mutually exclusive shapes, because Codex picks its credential source from
@@ -217,10 +305,23 @@ fn apply_provider_auth(provider: &mut Table, input: &RouteConfigInput) {
 /// Keeps `http_headers.x-ai-switch-platform` in sync without ever touching
 /// unrelated headers the user put there by hand. Passing `None` removes only the
 /// key this adapter owns, and drops the table once it is empty again.
+///
+/// TOML spells a table two ways — `[a.b]` blocks and `a = { … }` inline tables —
+/// and a hand-edited config may use either. Both have to be read and written in
+/// place: treating the inline form as "no table" would replace it with a fresh
+/// one and silently discard every header inside.
 fn set_platform_header(provider: &mut Table, platform: Option<&str>) {
     const HEADER: &str = "x-ai-switch-platform";
     match platform {
         Some(platform) => {
+            // Normalise whatever shape was there into a real table so the
+            // insert below works uniformly. `as_table_like_mut` is what covers
+            // the inline form.
+            if let Some(existing) = provider.get_mut("http_headers") {
+                if let Some(inline) = existing.as_inline_table_mut() {
+                    *existing = Item::Table(inline.clone().into_table());
+                }
+            }
             if !matches!(provider.get("http_headers"), Some(Item::Table(_))) {
                 provider["http_headers"] = Item::Table(Table::new());
             }
@@ -229,7 +330,7 @@ fn set_platform_header(provider: &mut Table, platform: Option<&str>) {
             }
         }
         None => {
-            let emptied = if let Some(headers) = provider["http_headers"].as_table_mut() {
+            let emptied = if let Some(headers) = provider["http_headers"].as_table_like_mut() {
                 headers.remove(HEADER);
                 headers.is_empty()
             } else {
@@ -267,8 +368,13 @@ fn base_last_path_segment(base_url: &str) -> Option<&str> {
 mod tests {
     use super::{codex_route_proxy_base_url, CodexAdapter};
     use crate::adapters::route_config::{ClaudeEnvPlan, RouteConfigInput, TargetAdapter};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use toml_edit::Document;
+
+    /// A ChatGPT login, matching what `codex login` leaves in `auth.json`.
+    const CHATGPT_AUTH: &str = r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"access_token":"oauth-access","refresh_token":"rt","id_token":"id","account_id":"acct"}}"#;
+    /// What an `apikey`-mode file looks like: no ChatGPT tokens to fall back on.
+    const APIKEY_AUTH: &str = r#"{"OPENAI_API_KEY":"sk-upstream","auth_mode":"apikey"}"#;
 
     fn input(keep_login_state: bool) -> RouteConfigInput {
         RouteConfigInput {
@@ -281,14 +387,30 @@ mod tests {
         }
     }
 
-    fn render(existing: Option<&[u8]>, keep_login_state: bool) -> Document {
+    /// Renders against a real `config.toml` path inside a temp `.codex` dir, so
+    /// the login check sees a sibling `auth.json` the way production does.
+    fn render_in(dir: &Path, existing: Option<&[u8]>, keep_login_state: bool) -> Document {
         let rendered = CodexAdapter
-            .render(Path::new("config.toml"), existing, &input(keep_login_state))
+            .render(&dir.join("config.toml"), existing, &input(keep_login_state))
             .expect("render");
         String::from_utf8(rendered)
             .expect("utf8")
             .parse::<Document>()
             .expect("valid toml")
+    }
+
+    /// Temp `.codex` dir pre-seeded with a ChatGPT login, which every
+    /// login-state render needs.
+    fn signed_in_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("auth.json"), CHATGPT_AUTH).expect("seed auth");
+        let path = dir.path().to_path_buf();
+        (dir, path)
+    }
+
+    fn render(existing: Option<&[u8]>, keep_login_state: bool) -> Document {
+        let (_dir, path) = signed_in_dir();
+        render_in(&path, existing, keep_login_state)
     }
 
     fn provider(document: &Document) -> &toml_edit::Table {
@@ -413,5 +535,129 @@ X-Region = "cn-north"
                 assert!(platform.is_none());
             }
         }
+    }
+
+    #[test]
+    fn unrelated_http_headers_survive_an_inline_table() {
+        // TOML lets the same table be written inline. A `[table]`-only check
+        // would treat this as "no headers" and overwrite it, silently dropping
+        // whatever the user put there by hand.
+        let existing = br#"[model_providers.ai-switch]
+name = "AI Switch Route Proxy"
+base_url = "http://127.0.0.1:43111/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-ai-switch-test"
+http_headers = { X-Region = "cn-north" }
+"#;
+
+        for keep_login_state in [true, false] {
+            let rendered = render(Some(existing), keep_login_state).to_string();
+            let document = rendered.parse::<Document>().expect("valid toml");
+            let headers = provider(&document)["http_headers"]
+                .as_table_like()
+                .expect("http_headers table-like");
+            assert_eq!(
+                headers.get("X-Region").and_then(|item| item.as_str()),
+                Some("cn-north"),
+                "an inline table must not be collateral damage"
+            );
+            let platform = headers.get("x-ai-switch-platform");
+            if keep_login_state {
+                assert_eq!(platform.and_then(|item| item.as_str()), Some("codex"));
+            } else {
+                assert!(platform.is_none());
+            }
+        }
+    }
+
+    fn render_error(dir: &Path, existing: Option<&[u8]>, keep_login_state: bool) -> String {
+        let error = CodexAdapter
+            .render(&dir.join("config.toml"), existing, &input(keep_login_state))
+            .expect_err("render must refuse a login-less write");
+        let crate::error::AppError::Validation { code, .. } = error else {
+            panic!("unexpected error shape: {error:?}");
+        };
+        code.to_string()
+    }
+
+    #[test]
+    fn keeping_the_login_state_refuses_an_apikey_only_auth_file() {
+        // `codex login` may never have run, or direct mode wrote `apikey` back.
+        // Either way there is no ChatGPT credential to hand off to, so the write
+        // has to fail loudly instead of leaving a provider that cannot auth.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("auth.json"), APIKEY_AUTH).expect("seed auth");
+
+        assert_eq!(
+            render_error(dir.path(), None, true),
+            "config.codex_login_not_chatgpt"
+        );
+    }
+
+    #[test]
+    fn keeping_the_login_state_refuses_a_missing_auth_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(
+            render_error(dir.path(), None, true),
+            "config.codex_login_missing"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_auth_file_is_reported_not_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("auth.json"), b"{not json").expect("seed auth");
+
+        assert_eq!(
+            render_error(dir.path(), None, true),
+            "config.codex_login_unreadable"
+        );
+    }
+
+    #[test]
+    fn the_proxy_key_shape_needs_no_login_at_all() {
+        // The check is scoped to the login-state branch: a user who never signed
+        // in must still be able to write the default provider.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let document = render_in(dir.path(), None, false);
+        assert_eq!(
+            provider(&document)["experimental_bearer_token"].as_str(),
+            Some("sk-ai-switch-test")
+        );
+    }
+
+    #[test]
+    fn login_state_probe_distinguishes_the_four_shapes() {
+        use super::{inspect_codex_login_state, CodexLoginState};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let probe = || inspect_codex_login_state(&config_path);
+
+        assert_eq!(probe(), CodexLoginState::Missing);
+
+        std::fs::write(dir.path().join("auth.json"), CHATGPT_AUTH).expect("seed auth");
+        assert_eq!(probe(), CodexLoginState::Chatgpt);
+
+        std::fs::write(dir.path().join("auth.json"), APIKEY_AUTH).expect("seed auth");
+        assert_eq!(
+            probe(),
+            CodexLoginState::NotChatgpt {
+                auth_mode: "apikey".to_string()
+            }
+        );
+
+        std::fs::write(dir.path().join("auth.json"), b"{not json").expect("seed auth");
+        assert!(matches!(probe(), CodexLoginState::Unreadable(_)));
+
+        // Empty tokens must not read as a usable login.
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"  "}}"#,
+        )
+        .expect("seed auth");
+        assert!(matches!(probe(), CodexLoginState::NotChatgpt { .. }));
     }
 }

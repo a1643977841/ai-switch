@@ -9,6 +9,7 @@ import type {
   ConfigSnapshotSummary,
   CodexOAuthMethod,
   CodexOAuthStatus,
+  CodexLoginState,
   ConfigWriteClientStatus,
   ConfigWriteOutcome,
   DirectModeStatus,
@@ -341,6 +342,16 @@ export function getSettings(): Promise<AppSettingsView> {
 
 export function saveSettings(settings: AppSettings): Promise<AppSettingsView> {
   return invoke("save_settings", { settings });
+}
+
+/**
+ * Whether this machine has a ChatGPT login Codex can fall back on.
+ *
+ * Only meaningful for the "keep Codex login state" switch: enabling it without a
+ * login would leave the client unable to authenticate.
+ */
+export function getCodexLoginState(): Promise<CodexLoginState> {
+  return invoke("get_codex_login_state");
 }
 
 export function startRouteProxy(): Promise<RouteProxyStatus> {

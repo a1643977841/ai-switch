@@ -1588,7 +1588,17 @@ command = "npx"
         let (_app_dir, paths, pool, runtime) = config_write_context().await;
         seed_codex_pool_member(&pool, "gpt-5.6-sol").await;
         let home = tempfile::tempdir().expect("home dir");
-        let codex_path = home.path().join(".codex").join("config.toml");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        // The login-state branch only writes when a ChatGPT login exists; this is
+        // what `codex login` leaves behind.
+        tokio::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"oauth-access","refresh_token":"rt","id_token":"id","account_id":"acct"}}"#,
+        )
+        .await
+        .expect("seed auth");
+        let codex_path = codex_dir.join("config.toml");
         let write = || {
             RouteConfigService::write_existing_config_for_home(
                 &paths,
@@ -1646,6 +1656,75 @@ command = "npx"
     }
 
     #[tokio::test]
+    async fn a_login_state_write_without_a_login_fails_and_keeps_the_old_config() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        seed_codex_pool_member(&pool, "gpt-5.6-sol").await;
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        let codex_path = codex_dir.join("config.toml");
+        // No auth.json at all, or an apikey-mode one: both mean there is no
+        // ChatGPT credential to hand off to.
+        for auth in [None, Some(r#"{"OPENAI_API_KEY":"sk-upstream","auth_mode":"apikey"}"#)] {
+            match auth {
+                Some(contents) => {
+                    tokio::fs::write(codex_dir.join("auth.json"), contents)
+                        .await
+                        .expect("seed auth");
+                }
+                None => {
+                    let _ = tokio::fs::remove_file(codex_dir.join("auth.json")).await;
+                }
+            }
+            let write = || {
+                RouteConfigService::write_existing_config_for_home(
+                    &paths,
+                    &pool,
+                    &runtime,
+                    home.path(),
+                    "http://127.0.0.1:43111",
+                    "codex",
+                    "sk-ai-switch-test",
+                )
+            };
+
+            // Write a working default config first, then flip the switch. Reset
+            // the switch each round: the settings file outlives the loop and the
+            // previous iteration left it on.
+            let mut settings = SettingsService::load(&paths).await.expect("settings");
+            settings.codex_keep_login_state = false;
+            SettingsService::save(&paths, &settings)
+                .await
+                .expect("save settings");
+            write().await.expect("seed config");
+            let before = tokio::fs::read_to_string(&codex_path)
+                .await
+                .expect("read config");
+            let mut settings = SettingsService::load(&paths).await.expect("settings");
+            settings.codex_keep_login_state = true;
+            SettingsService::save(&paths, &settings)
+                .await
+                .expect("save settings");
+
+            let error = write().await.expect_err("write must be refused");
+            // The coordinator wraps per-target failures, but the real reason is
+            // preserved in `cause_code` (which the UI reads as `error_code`).
+            let details = format!("{error:?}");
+            assert!(
+                details.contains("config.codex_login_missing")
+                    || details.contains("config.codex_login_not_chatgpt"),
+                "unexpected error: {details}"
+            );
+            // The previously working config must survive untouched — replacing
+            // it with an unauthenticated provider is the failure this prevents.
+            let after = tokio::fs::read_to_string(&codex_path)
+                .await
+                .expect("read config");
+            assert_eq!(before, after);
+        }
+    }
+
+    #[tokio::test]
     async fn stale_check_reports_a_codex_login_state_change() {
         use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
 
@@ -1657,6 +1736,16 @@ command = "npx"
             .await
             .expect("codex key");
         let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        // Flipping the switch only produces a different config when a ChatGPT
+        // login exists; without one the write is refused by design.
+        tokio::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"oauth-access","refresh_token":"rt","id_token":"id","account_id":"acct"}}"#,
+        )
+        .await
+        .expect("seed auth");
         let base_url = "http://127.0.0.1:43111";
         let is_stale = || {
             RouteConfigService::config_write_is_stale_for_home(

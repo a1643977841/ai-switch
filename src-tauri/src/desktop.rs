@@ -50,7 +50,7 @@ use commands::route_proxy_https_commands::{
     uninstall_route_proxy_root_ca,
 };
 use commands::session_commands::{get_session_messages, list_sessions, open_session_terminal};
-use commands::settings_commands::{get_settings, save_settings};
+use commands::settings_commands::{get_codex_login_state, get_settings, save_settings};
 use commands::target_commands::{
     list_config_snapshots, list_config_write_clients, list_target_apps,
     list_target_config_statuses, rollback_config_snapshot,
@@ -557,6 +557,7 @@ pub fn run() {
             imagegen_read_asset,
             get_settings,
             save_settings,
+            get_codex_login_state,
             create_batch,
             list_batch_groups,
             create_provider,

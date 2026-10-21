@@ -10,6 +10,7 @@ import {
   enableRouteProxyHttps,
   getRouteProxyHttpsStatus,
   getRouteProxyStatus,
+  getCodexLoginState,
   getSettings,
   getTailscaleStatus,
   getWebServerStatus,
@@ -34,6 +35,7 @@ import { settingsFixture } from "../src/test/fixtures";
 vi.mock("../src/lib/api/client", () => ({
   createMobilePairing: vi.fn(),
   getSettings: vi.fn(),
+  getCodexLoginState: vi.fn(),
   saveSettings: vi.fn(),
   getWebServiceConfig: vi.fn(),
   saveWebServiceConfig: vi.fn(),
@@ -111,6 +113,14 @@ describe("SettingsScreen", () => {
     window.localStorage.clear();
     vi.mocked(createMobilePairing).mockReset();
     vi.mocked(getSettings).mockReset();
+    vi.mocked(getCodexLoginState).mockReset();
+    // Most cases never touch the Codex-login card, but the query still fires;
+    // a signed-in default keeps those tests focused on their own subject.
+    vi.mocked(getCodexLoginState).mockResolvedValue({
+      usable: true,
+      state: "chatgpt",
+      auth_mode: "chatgpt",
+    });
     vi.mocked(saveSettings).mockReset();
     vi.mocked(getWebServiceConfig).mockReset();
     vi.mocked(saveWebServiceConfig).mockReset();
@@ -385,6 +395,46 @@ describe("SettingsScreen", () => {
     });
   });
 
+  it("warns about a missing ChatGPT login before the switch is used", async () => {
+    // Turning the switch on without a ChatGPT login leaves Codex unable to
+    // authenticate; the write is refused, so say why before the user tries.
+    vi.mocked(getSettings).mockResolvedValue(settingsFixture);
+    vi.mocked(getCodexLoginState).mockResolvedValue({
+      usable: false,
+      state: "not_chatgpt",
+      auth_mode: "apikey",
+    });
+
+    render(
+      <QueryClientProvider client={createQueryClient()}>
+        <I18nProvider initialLanguage="zh-CN">
+          <SettingsScreen />
+        </I18nProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText(/当前 Codex 只有 API Key 登录，没有可保留的 ChatGPT 登录态/),
+    ).toBeInTheDocument();
+  });
+
+  it("stays quiet when a ChatGPT login is available", async () => {
+    vi.mocked(getSettings).mockResolvedValue(settingsFixture);
+
+    render(
+      <QueryClientProvider client={createQueryClient()}>
+        <I18nProvider initialLanguage="zh-CN">
+          <SettingsScreen />
+        </I18nProvider>
+      </QueryClientProvider>,
+    );
+
+    await screen.findByRole("checkbox", { name: "保持 Codex 登录态" });
+    expect(
+      screen.queryByText(/没有可保留的 ChatGPT 登录态/),
+    ).not.toBeInTheDocument();
+  });
+
   it("saves language changes and updates the selector", async () => {
     const englishSettings = { ...settingsFixture, language: "en" };
     vi.mocked(getSettings).mockResolvedValue(englishSettings);
@@ -650,12 +700,15 @@ describe("SettingsScreen", () => {
     );
 
     await userEvent.click(await screen.findByRole("button", { name: "Start service port" }));
-    await waitFor(() => expect(startWebServer).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(getTailscaleStatus).toHaveBeenCalledTimes(2));
+    // `userEvent` drives real timers, and the whole file runs concurrently under
+    // load; the 1s default has been observed to expire here at ~1.9s even though
+    // the case only needs ~450ms on an idle machine.
+    await waitFor(() => expect(startWebServer).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await waitFor(() => expect(getTailscaleStatus).toHaveBeenCalledTimes(2), { timeout: 5000 });
 
     await userEvent.click(await screen.findByRole("button", { name: "Stop service port" }));
-    await waitFor(() => expect(stopWebServer).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(getTailscaleStatus).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(stopWebServer).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await waitFor(() => expect(getTailscaleStatus).toHaveBeenCalledTimes(3), { timeout: 5000 });
   });
 
   it("explains and blocks startup when the Web token is too short", async () => {
@@ -681,7 +734,15 @@ describe("SettingsScreen", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: "启动服务端口" }));
 
-    expect(await screen.findByText("访问令牌至少需要 16 个字符，请更换后再启动。")).toBeInTheDocument();
+    // See the secure-network case: `findBy*` also defaults to 1s, which this
+    // file can exceed when every test runs at once.
+    expect(
+      await screen.findByText(
+        "访问令牌至少需要 16 个字符，请更换后再启动。",
+        undefined,
+        { timeout: 5000 },
+      ),
+    ).toBeInTheDocument();
     expect(startWebServer).not.toHaveBeenCalled();
     expect(saveWebServiceConfig).not.toHaveBeenCalled();
   });

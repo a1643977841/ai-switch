@@ -381,6 +381,13 @@ function formatApiError(error: unknown, fallback: string): string {
  * Chinese copy for config-write failures whose backend message does not convey
  * the consequence. Keyed by error code so the wording stays with the reason.
  */
+/**
+ * Codes that describe a *single target's* failure inside a grouped write.
+ *
+ * A grouped write reports one `filesystem.route_config_write` for the whole
+ * batch and parks the real reason in `details.cause_code` / `targets[].error_code`,
+ * so a message keyed only on the outer code is always the generic fallback.
+ */
 const configWriteErrorMessages: Record<string, string> = {
   // A failed parse makes a client fall back to its defaults and end up with an
   // empty provider list, so "we did not touch it" is the load-bearing part.
@@ -390,14 +397,60 @@ const configWriteErrorMessages: Record<string, string> = {
     "配置文件在写入期间被其他程序修改，未做改动。请重试。",
   "config.pool_models_empty": "算力池中没有可用模型，请先向池中加入账号。",
   "config.client_unavailable": "所选客户端不支持当前平台。",
+  // Keeping the Codex login hands authentication to `auth.json`; without a
+  // ChatGPT login there is nothing to hand it to and the client would fail every
+  // request. The write is refused instead, so say how to fix it.
+  "config.codex_login_missing":
+    "已开启「保持 Codex 登录态」，但未找到 Codex 登录文件。请先在 Codex 中登录后再写入。",
+  "config.codex_login_not_chatgpt":
+    "已开启「保持 Codex 登录态」，但当前 Codex 只有 API Key 登录、没有 ChatGPT 登录态。请先执行 codex login 登录，或关闭该开关。",
+  "config.codex_login_unreadable":
+    "Codex 登录文件无法读取，已拒绝写入以免配置无法鉴权。请检查该文件后重试。",
 };
+
+/**
+ * Best-effort read of the failure code, including the code a grouped write
+ * nested inside its `details` payload.
+ */
+function configWriteErrorCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "";
+  const outer = (error as { code?: unknown }).code;
+  const code = typeof outer === "string" ? outer : "";
+  // A direct code is already the most specific thing we have.
+  if (code && configWriteErrorMessages[code]) return code;
+
+  const details = (error as { details?: unknown }).details;
+  let parsed: unknown = details;
+  if (typeof details === "string") {
+    try {
+      parsed = JSON.parse(details) as unknown;
+    } catch {
+      parsed = null;
+    }
+  }
+  if (parsed && typeof parsed === "object") {
+    const record = parsed as { cause_code?: unknown; targets?: unknown };
+    if (typeof record.cause_code === "string" && configWriteErrorMessages[record.cause_code]) {
+      return record.cause_code;
+    }
+    if (Array.isArray(record.targets)) {
+      for (const target of record.targets) {
+        const targetCode =
+          target && typeof target === "object"
+            ? (target as { error_code?: unknown }).error_code
+            : null;
+        if (typeof targetCode === "string" && configWriteErrorMessages[targetCode]) {
+          return targetCode;
+        }
+      }
+    }
+  }
+  return code;
+}
 
 /** Prefers a code-specific Chinese message over the backend's raw text. */
 function formatConfigWriteError(error: unknown): string {
-  const code =
-    error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
-      ? (error as { code: string }).code
-      : "";
+  const code = configWriteErrorCode(error);
   return configWriteErrorMessages[code] ?? formatApiError(error, "配置写入失败。");
 }
 

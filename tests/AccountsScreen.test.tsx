@@ -7141,6 +7141,41 @@ describe("AccountsScreen", () => {
     ).toBeInTheDocument();
   });
 
+  it("surfaces the code a grouped write nested instead of the generic failure", async () => {
+    // A grouped write reports one wrapper code for the whole batch and parks the
+    // real reason in `details.cause_code`. Reading only the outer code would show
+    // "配置写入失败。" and hide the actionable part.
+    vi.mocked(writeRouteProxyConfigs).mockRejectedValue({
+      code: "filesystem.route_config_write",
+      message: "Could not complete grouped configuration writes",
+      details: JSON.stringify({
+        operation_id: "operation-1",
+        cause_code: "config.codex_login_not_chatgpt",
+        targets: [
+          {
+            target_key: "codex",
+            status: "failed",
+            error_code: "config.codex_login_not_chatgpt",
+          },
+        ],
+      }),
+      recoverable: true,
+    });
+    renderScreen();
+
+    await screen.findByText("算力池路由：已关闭");
+    await userEvent.click(screen.getByLabelText("启用算力池路由接入"));
+    expect(await screen.findByText("算力池路由：http://127.0.0.1:43111")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("写入路由配置文件"));
+    await screen.findByText("接入算力池");
+    await userEvent.click(screen.getByRole("button", { name: "写入" }));
+
+    expect(
+      await screen.findByText(/当前 Codex 只有 API Key 登录、没有 ChatGPT 登录态/),
+    ).toBeInTheDocument();
+  });
+
   it("lets the browser disable route access without stopping the process-owned listener", async () => {
     vi.mocked(isDesktop).mockReturnValue(false);
     vi.mocked(getRouteProxyStatus).mockResolvedValue({

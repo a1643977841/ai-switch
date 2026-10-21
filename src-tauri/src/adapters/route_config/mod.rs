@@ -10,6 +10,7 @@ mod workbuddy;
 mod zcode;
 
 pub(crate) use codex::codex_model_catalog_path;
+pub(crate) use codex::{inspect_codex_login_state, CodexLoginState};
 
 use crate::{
     error::AppError,

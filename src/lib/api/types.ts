@@ -1198,6 +1198,21 @@ export type AppSettingsView = AppSettings & {
   ccswitch_deeplink_compat_supported?: boolean;
 };
 
+/**
+ * Whether `codex_keep_login_state` can work on this machine.
+ *
+ * The write path refuses to produce a provider that cannot authenticate, so the
+ * settings card checks first instead of letting the user find out on a failed
+ * write.
+ */
+export type CodexLoginState = {
+  usable: boolean;
+  /** `chatgpt` | `missing` | `unreadable` | `not_chatgpt` */
+  state: string;
+  /** The `auth_mode` Codex recorded, when the file was readable. */
+  auth_mode?: string | null;
+};
+
 export type SessionMeta = {
   providerId: string;
   sessionId: string;
