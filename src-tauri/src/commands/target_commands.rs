@@ -140,6 +140,7 @@ mod tests {
                     route_proxy_key: "sk-ai-switch-test".to_string(),
                     route_proxy_key_aliases: Vec::new(),
                     claude_env: ClaudeEnvPlan::default(),
+                    codex_keep_login_state: false,
                     client_models: Vec::new(),
                 },
             },

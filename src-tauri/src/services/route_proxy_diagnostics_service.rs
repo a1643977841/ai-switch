@@ -549,6 +549,7 @@ mod tests {
             route_proxy_request_body_limit_mib: 128,
             proxy_enabled: false,
             proxy_url: None,
+            codex_keep_login_state: false,
         };
         settings.notification_config_json = Some(
             json!({

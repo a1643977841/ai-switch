@@ -109,6 +109,7 @@ impl RouteConfigService {
 
         let aliases =
             RouteProxyKeyRepository::list_aliases_for_platform(pool, platform_key).await?;
+        let codex_keep_login_state = Self::resolve_codex_keep_login_state(paths, platform).await;
 
         // One group per client: `write_group` aborts the whole group when any
         // prepare fails, so grouping them would let a corrupt ZCode config cost
@@ -128,6 +129,7 @@ impl RouteConfigService {
                     route_proxy_key_aliases: aliases.clone(),
                     claude_env: claude_env.clone(),
                     client_models: client_models.clone(),
+                    codex_keep_login_state,
                 },
             };
             match DirectModeService::write_route(paths, pool, runtime, request, false).await {
@@ -265,6 +267,8 @@ impl RouteConfigService {
                     route_proxy_key_aliases: Vec::new(),
                     claude_env,
                     client_models,
+                    codex_keep_login_state: Self::resolve_codex_keep_login_state(paths, parsed)
+                        .await,
                 },
             });
         }
@@ -349,6 +353,11 @@ impl RouteConfigService {
             Self::resolve_models_for_config_input(pool, platform, needs_models).await?;
         let aliases =
             RouteProxyKeyRepository::list_aliases_for_platform(pool, platform.as_str()).await?;
+        // The staleness probe renders through the real adapter, so it must see
+        // the same switch state a write would. Flipping the toggle in settings
+        // then shows up as "config out of date" instead of silently waiting for
+        // an unrelated pool change.
+        let codex_keep_login_state = Self::resolve_codex_keep_login_state(paths, platform).await;
 
         for adapter in adapters {
             if DirectModeService::has_direct(pool, adapter.client_key()).await? {
@@ -365,6 +374,7 @@ impl RouteConfigService {
                 route_proxy_key_aliases: aliases.clone(),
                 claude_env: claude_env.clone(),
                 client_models: client_models.clone(),
+                codex_keep_login_state,
             };
             // One client's render error must not hide another client's real drift.
             let Ok(rendered) = adapter.render(&path, Some(&existing), &input) else {
@@ -410,6 +420,7 @@ impl RouteConfigService {
                 route_proxy_key_aliases: Vec::new(),
                 claude_env,
                 client_models,
+                codex_keep_login_state: Self::resolve_codex_keep_login_state(paths, platform).await,
             },
         };
         if DirectModeService::has_direct(pool, request.adapter.client_key()).await? {
@@ -687,6 +698,23 @@ impl RouteConfigService {
                 settings.claude_client_config_json.as_deref(),
             ),
         })
+    }
+
+    /// Whether the Codex provider should keep the client's ChatGPT login.
+    ///
+    /// Only applies to the Codex platform: the switch describes Codex's own
+    /// `auth.json` credential, which no other client reads. A settings read
+    /// failure falls back to `false` — the default-off shape is the one that
+    /// works without a login, so an unreadable settings file must not push every
+    /// platform onto the experimental path.
+    async fn resolve_codex_keep_login_state(paths: &AppPaths, platform: PlatformId) -> bool {
+        if platform != PlatformId::Codex {
+            return false;
+        }
+        SettingsService::load(paths)
+            .await
+            .map(|settings| settings.codex_keep_login_state)
+            .unwrap_or(false)
     }
 
     async fn write_codex_model_catalog(pool: &SqlitePool, home: &Path) -> Result<(), AppError> {
@@ -1553,6 +1581,116 @@ command = "npx"
         assert!(written.contains("base_url = \"http://127.0.0.1:43111/v1\""));
         assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
         assert!(!written.contains("api_key = \"sk-ai-switch-test\""));
+    }
+
+    #[tokio::test]
+    async fn codex_keep_login_state_switch_reaches_the_written_config() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        seed_codex_pool_member(&pool, "gpt-5.6-sol").await;
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_path = home.path().join(".codex").join("config.toml");
+        let write = || {
+            RouteConfigService::write_existing_config_for_home(
+                &paths,
+                &pool,
+                &runtime,
+                home.path(),
+                "http://127.0.0.1:43111",
+                "codex",
+                "sk-ai-switch-test",
+            )
+        };
+        let read = || async {
+            tokio::fs::read_to_string(&codex_path)
+                .await
+                .expect("read config")
+        };
+        let set_switch = |keep: bool| {
+            let paths = paths.clone();
+            async move {
+                let mut settings = SettingsService::load(&paths).await.expect("settings");
+                settings.codex_keep_login_state = keep;
+                SettingsService::save(&paths, &settings)
+                    .await
+                    .expect("save settings");
+            }
+        };
+
+        // Default: the proxy key authenticates Codex, no login hand-off.
+        write().await.expect("write config");
+        let written = read().await;
+        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
+        assert!(!written.contains("requires_openai_auth"));
+
+        // Switched on: Codex keeps its ChatGPT login and loses the proxy key.
+        set_switch(true).await;
+        write().await.expect("write config");
+        let written = read().await;
+        assert!(written.contains("requires_openai_auth = true"));
+        assert!(written.contains("name = \"OpenAI\""));
+        assert!(written.contains("x-ai-switch-platform = \"codex\""));
+        assert!(
+            !written.contains("experimental_bearer_token"),
+            "the bearer token would outrank the login and void the switch"
+        );
+        // The gateway URL must still be the proxy, not the official backend.
+        assert!(written.contains("base_url = \"http://127.0.0.1:43111/v1\""));
+
+        // Toggling back must fully restore the default shape.
+        set_switch(false).await;
+        write().await.expect("write config");
+        let written = read().await;
+        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
+        assert!(!written.contains("requires_openai_auth"));
+        assert!(!written.contains("x-ai-switch-platform"));
+    }
+
+    #[tokio::test]
+    async fn stale_check_reports_a_codex_login_state_change() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        seed_codex_pool_member(&pool, "gpt-5.6-sol").await;
+        // The probe bails out early for platforms that never got a managed key,
+        // so the key has to exist before a written config can be compared.
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+            .await
+            .expect("codex key");
+        let home = tempfile::tempdir().expect("home dir");
+        let base_url = "http://127.0.0.1:43111";
+        let is_stale = || {
+            RouteConfigService::config_write_is_stale_for_home(
+                &paths,
+                &pool,
+                base_url,
+                "codex",
+                home.path(),
+                None,
+            )
+        };
+
+        RouteConfigService::write_existing_config_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            home.path(),
+            base_url,
+            "codex",
+            "sk-ai-switch-test",
+        )
+        .await
+        .expect("write config");
+        assert!(!is_stale().await);
+
+        // The probe renders through the real adapter, so flipping this switch
+        // has to read as pending work — otherwise the file stays on the old
+        // auth shape until some unrelated edit happens to rewrite it.
+        let mut settings = SettingsService::load(&paths).await.expect("settings");
+        settings.codex_keep_login_state = true;
+        SettingsService::save(&paths, &settings)
+            .await
+            .expect("save settings");
+        assert!(is_stale().await);
     }
 
     #[tokio::test]

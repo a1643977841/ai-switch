@@ -49,6 +49,11 @@ pub struct RouteConfigInput {
     /// Models the pool advertises, for clients that cannot discover models on
     /// their own. Empty for clients that can — the four native CLIs ignore it.
     pub client_models: Vec<ClientModel>,
+    /// Codex only. When set, the provider entry keeps the client on its ChatGPT
+    /// login (`requires_openai_auth`) instead of the local proxy key, so
+    /// login-gated features keep working behind the gateway. Defaults to off
+    /// for every other client and every existing caller.
+    pub codex_keep_login_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +317,7 @@ mod tests {
             route_proxy_key: ROUTE_PROXY_KEY.to_string(),
             route_proxy_key_aliases: Vec::new(),
             claude_env: ClaudeEnvPlan::default(),
+            codex_keep_login_state: false,
             client_models: Vec::new(),
         }
     }

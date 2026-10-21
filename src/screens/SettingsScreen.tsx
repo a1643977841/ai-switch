@@ -191,6 +191,7 @@ export function SettingsScreen({
   };
 
   const requestBodyLimit = settings.route_proxy_request_body_limit_mib ?? 128;
+  const codexKeepLoginState = settings.codex_keep_login_state ?? false;
   const saveRequestBodyLimit = () => {
     const draft = requestBodyLimitDraft ?? String(requestBodyLimit);
     const value = Number(draft);
@@ -381,6 +382,29 @@ export function SettingsScreen({
             <span className="text-[11px] font-medium text-stone-500">{t("settings.proxy.hint")}</span>
           )}
         </label>
+      </div>
+
+      <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
+        <h2 className="text-[15px] font-semibold text-stone-950">
+          {t("settings.codexLogin.title")}
+        </h2>
+        <p className="text-[12px] text-stone-500">{t("settings.codexLogin.subtitle")}</p>
+        <label className="flex max-w-xl items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-[12px] font-semibold text-stone-700">
+          <input
+            aria-label={t("settings.codexLogin.enable")}
+            checked={codexKeepLoginState}
+            className="mt-0.5"
+            disabled={saveMutation.isPending}
+            onChange={(event) =>
+              saveMutation.mutate({ ...settings, codex_keep_login_state: event.target.checked })
+            }
+            type="checkbox"
+          />
+          <span>{t("settings.codexLogin.enable")}</span>
+        </label>
+        <p className="text-[11px] font-medium text-stone-500">
+          {t("settings.codexLogin.hint")}
+        </p>
       </div>
 
       <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">

@@ -347,6 +347,7 @@ mod tests {
             route_proxy_key: KEY.to_string(),
             route_proxy_key_aliases: Vec::new(),
             claude_env: ClaudeEnvPlan::default(),
+            codex_keep_login_state: false,
             client_models: models
                 .iter()
                 .map(|id| ClientModel {

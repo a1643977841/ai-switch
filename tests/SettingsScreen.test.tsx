@@ -359,6 +359,32 @@ describe("SettingsScreen", () => {
     expect(await screen.findByText("设置已保存。")).toBeInTheDocument();
   });
 
+  it("leaves the Codex login opt-in and saves it when ticked", async () => {
+    vi.mocked(getSettings).mockResolvedValue(settingsFixture);
+    vi.mocked(saveSettings).mockImplementation(async (settings) => settings);
+
+    render(
+      <QueryClientProvider client={createQueryClient()}>
+        <I18nProvider initialLanguage="zh-CN">
+          <SettingsScreen />
+        </I18nProvider>
+      </QueryClientProvider>,
+    );
+
+    // Off unless the user opts in: enabling it drops the proxy key from the
+    // Codex provider, which only works when a ChatGPT login exists.
+    const toggle = await screen.findByRole("checkbox", { name: "保持 Codex 登录态" });
+    expect(toggle).not.toBeChecked();
+
+    await userEvent.click(toggle);
+
+    await waitFor(() => expect(saveSettings).toHaveBeenCalled());
+    expect(vi.mocked(saveSettings).mock.calls.at(-1)![0]).toEqual({
+      ...settingsFixture,
+      codex_keep_login_state: true,
+    });
+  });
+
   it("saves language changes and updates the selector", async () => {
     const englishSettings = { ...settingsFixture, language: "en" };
     vi.mocked(getSettings).mockResolvedValue(englishSettings);

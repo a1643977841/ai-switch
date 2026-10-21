@@ -1184,6 +1184,14 @@ export type AppSettings = {
   proxy_url?: string | null;
   /** Model proxy request body limit in MiB. Defaults to 128; 0 disables the limit. */
   route_proxy_request_body_limit_mib?: number;
+  /**
+   * Write the Codex provider so the client keeps authenticating with its own
+   * ChatGPT login instead of the local proxy key, keeping login-gated features
+   * (web search, remote compaction) working behind the gateway. Off by default:
+   * it only works when a login exists, and it removes the bearer token from the
+   * provider entry.
+   */
+  codex_keep_login_state?: boolean;
 };
 
 export type AppSettingsView = AppSettings & {

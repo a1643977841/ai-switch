@@ -454,6 +454,7 @@ mod tests {
             route_proxy_key: CODEX_KEY.to_string(),
             route_proxy_key_aliases: Vec::new(),
             claude_env: crate::adapters::route_config::ClaudeEnvPlan::default(),
+            codex_keep_login_state: false,
             client_models: models
                 .iter()
                 .map(|id| ClientModel {

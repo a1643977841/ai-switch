@@ -1077,6 +1077,7 @@ mod tests {
                     route_proxy_key: ROUTE_PROXY_KEY.to_string(),
                     route_proxy_key_aliases: Vec::new(),
                     claude_env: ClaudeEnvPlan::default(),
+                    codex_keep_login_state: false,
                     client_models: Vec::new(),
                 },
             }
@@ -1099,6 +1100,7 @@ mod tests {
                     route_proxy_key: ROUTE_PROXY_KEY.to_string(),
                     route_proxy_key_aliases: Vec::new(),
                     claude_env: ClaudeEnvPlan::default(),
+                    codex_keep_login_state: false,
                     client_models: Vec::new(),
                 },
             }

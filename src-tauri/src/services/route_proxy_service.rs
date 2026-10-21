@@ -16073,12 +16073,16 @@ data: [DONE]\n\n";
             HeaderValue::from_static("sk-ai-switch-local"),
         );
         headers.insert("accept", HeaderValue::from_static("application/json"));
+        // Written into the "keep Codex login" provider. The proxy only reads it
+        // to resolve the platform; leaking it upstream would be meaningless.
+        headers.insert(ROUTE_PROXY_PLATFORM_HEADER, HeaderValue::from_static("codex"));
 
         strip_route_proxy_auth_headers(&mut headers);
 
         assert!(headers.get("authorization").is_none());
         assert!(headers.get("x-api-key").is_none());
         assert!(headers.get("x-goog-api-key").is_none());
+        assert!(headers.get(ROUTE_PROXY_PLATFORM_HEADER).is_none());
         assert_eq!(
             headers.get("accept"),
             Some(&HeaderValue::from_static("application/json"))
@@ -16254,6 +16258,42 @@ data: [DONE]\n\n";
             other => panic!("unexpected error: {other:?}"),
         };
         assert!(!message.contains(key));
+    }
+
+    #[tokio::test]
+    async fn resolve_platform_accepts_a_chatgpt_token_when_the_header_names_the_platform() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        // The "keep Codex login" provider carries no proxy key, so the inbound
+        // Authorization is the user's ChatGPT token. Without this fallback every
+        // such request would be rejected as an invalid key. The token itself is
+        // only used for identification — `build_upstream_request` overwrites the
+        // header with the pooled credential's own key.
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let state = ProxyAppState {
+            pool,
+            access_scope: None,
+            model_match_mode: ModelMatchMode::ClientFacing,
+            key_cache: Arc::new(Mutex::new(RouteProxyKeyCache::default())),
+            activity: RouteCredentialActivityRegistry::default(),
+            live_log: RouteProxyLiveLog::default(),
+            codex_history: CodexReasoningCache::default(),
+            upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer eyJhbGciOiJSUzI1NiJ9.chatgpt-access-token"),
+        );
+        headers.insert(ROUTE_PROXY_PLATFORM_HEADER, HeaderValue::from_static("codex"));
+
+        let platform = resolve_platform(&state, &headers, Some("eyJhbGciOiJSUzI1NiJ9.chatgpt-access-token"))
+            .await
+            .expect("header identifies the platform even without a matching key");
+        assert_eq!(platform, PlatformId::Codex);
     }
 
     #[test]

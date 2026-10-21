@@ -59,6 +59,12 @@ pub struct AppSettings {
     /// Maximum inbound model request size in MiB; 0 disables this local limit.
     #[serde(default = "default_route_proxy_request_body_limit_mib")]
     pub route_proxy_request_body_limit_mib: u32,
+    /// Write the Codex provider entry so the client keeps authenticating with
+    /// the ChatGPT login in `~/.codex/auth.json` instead of the local proxy
+    /// key. Off by default: it only works when that login exists, and enabling
+    /// it removes `experimental_bearer_token` from the provider table.
+    #[serde(default)]
+    pub codex_keep_login_state: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +86,7 @@ pub struct AppSettingsView {
     pub proxy_enabled: bool,
     pub proxy_url: Option<String>,
     pub route_proxy_request_body_limit_mib: u32,
+    pub codex_keep_login_state: bool,
 }
 
 impl AppSettingsView {
@@ -102,6 +109,7 @@ impl AppSettingsView {
             proxy_enabled: settings.proxy_enabled,
             proxy_url: settings.proxy_url,
             route_proxy_request_body_limit_mib: settings.route_proxy_request_body_limit_mib,
+            codex_keep_login_state: settings.codex_keep_login_state,
         }
     }
 }
@@ -125,6 +133,7 @@ impl AppSettings {
             proxy_enabled: false,
             proxy_url: None,
             route_proxy_request_body_limit_mib: DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB,
+            codex_keep_login_state: false,
         }
     }
 }
@@ -158,5 +167,12 @@ mod tests {
         assert!(!settings.image_generation_enabled);
         assert!(!settings.proxy_enabled);
         assert!(settings.proxy_url.is_none());
+        // Keeping the ChatGPT login is opt-in: a settings file from before the
+        // switch existed must not silently start writing auth-free providers.
+        assert!(!settings.codex_keep_login_state);
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["codex_keep_login_state"],
+            false,
+        );
     }
 }
