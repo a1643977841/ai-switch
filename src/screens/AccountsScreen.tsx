@@ -4771,7 +4771,9 @@ export function AccountsScreen({
       setRoutePoolFeedback(null);
     },
     onSuccess: (state, variables) => {
-      if (variables.group_id) {
+      // Moving a member changes where it lives, not which group the user is browsing.
+      // Keep the current group selected so the list does not jump under the user.
+      if (variables.action !== "move" && variables.group_id) {
         setSelectedGroupId(variables.group_id);
       }
       const message =

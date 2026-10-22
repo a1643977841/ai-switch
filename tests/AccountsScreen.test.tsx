@@ -2444,10 +2444,10 @@ describe("AccountsScreen", () => {
       expect(lastCall?.group_id).toBe("codex-out");
       expect(lastCall?.account_ids).toEqual(["cred-official-1"]);
     });
-    expect(await screen.findByText("Team Account")).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByText("API Account")).not.toBeInTheDocument());
-
-    await userEvent.click(screen.getByLabelText("选择 Team Account"));
+    await waitFor(() => expect(screen.queryByText("Team Account")).not.toBeInTheDocument());
+    expect(screen.getByText("API Account")).toBeInTheDocument();
+    await selectAccountView("未入池");
+    await userEvent.click(await screen.findByLabelText("选择 Team Account"));
     expect(screen.getByText("已选 1 个账号")).toBeInTheDocument();
     await userEvent.click(screen.getByLabelText("批量删除账号"));
     expect(deleteRouteCredential).not.toHaveBeenCalled();
@@ -2741,6 +2741,31 @@ describe("AccountsScreen", () => {
     );
     await selectAccountView("未入池");
     expect(await screen.findByText("Team Account")).toBeInTheDocument();
+  });
+
+  it("stays in the current group after moving an account to another group", async () => {
+    poolStateByPlatform.set("codex", ["cred-official-1"]);
+    renderScreen("codex", "in_pool");
+
+    await waitFor(() =>
+      expect(screen.getByTitle(/^默认组/)).toHaveAttribute("aria-pressed", "true"),
+    );
+    await userEvent.click(await screen.findByLabelText("选择 Team Account"));
+    await userEvent.selectOptions(screen.getByLabelText("移动到分组"), "codex-out");
+
+    await waitFor(() =>
+      expect(moveRoutePoolGroupMembers).toHaveBeenLastCalledWith({
+        platform: "codex",
+        group_id: "codex-out",
+        account_ids: ["cred-official-1"],
+      }),
+    );
+    expect(screen.getByTitle(/^默认组/)).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTitle(/^未入池/)).toHaveAttribute("aria-pressed", "false");
+    await waitFor(() =>
+      expect(screen.queryByText("Team Account")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("已移动 1 个账号。")).toBeInTheDocument();
   });
 
   it("shows the stored failure response for error and cooldown accounts", async () => {
