@@ -2768,6 +2768,23 @@ describe("AccountsScreen", () => {
     expect(screen.getByText("已移动 1 个账号。")).toBeInTheDocument();
   });
 
+  it("selects all visible accounts and inverts the current page selection", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByLabelText("全选当前页账号"));
+    expect(screen.getByText("已选 2 个账号")).toBeInTheDocument();
+    expect(screen.getByLabelText("选择 Team Account")).toBeChecked();
+    expect(screen.getByLabelText("选择 API Account")).toBeChecked();
+
+    await userEvent.click(screen.getByLabelText("选择 Team Account"));
+    expect(screen.getByText("已选 1 个账号")).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText("反选当前页账号"));
+
+    expect(screen.getByText("已选 1 个账号")).toBeInTheDocument();
+    expect(screen.getByLabelText("选择 Team Account")).toBeChecked();
+    expect(screen.getByLabelText("选择 API Account")).not.toBeChecked();
+  });
+
   it("shows the stored failure response for error and cooldown accounts", async () => {
     const retryAt = new Date(Date.now() + 60_000).toISOString();
     vi.mocked(listRouteCredentials).mockResolvedValue([

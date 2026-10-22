@@ -5806,6 +5806,30 @@ export function AccountsScreen({
     setSelectedAccountIds(new Set());
   };
 
+  const selectAllVisibleAccounts = () => {
+    setSelectedAccountIds((current) => {
+      const next = new Set(current);
+      for (const credential of credentials) {
+        next.add(credential.id);
+      }
+      return next;
+    });
+  };
+
+  const invertVisibleAccountSelection = () => {
+    setSelectedAccountIds((current) => {
+      const next = new Set(current);
+      for (const credential of credentials) {
+        if (next.has(credential.id)) {
+          next.delete(credential.id);
+        } else {
+          next.add(credential.id);
+        }
+      }
+      return next;
+    });
+  };
+
   const setSelectedAccountsStatus = () => {
     if (selectedAccountIds.size === 0 || !batchStatus || batchStatusMutation.isPending) {
       return;
@@ -7346,6 +7370,26 @@ export function AccountsScreen({
                 ariaLabel="关闭批量设置状态错误"
                 onClick={() => batchStatusMutation.reset()}
               />
+            </div>
+          )}
+          {!credentialsQuery.isLoading && credentials.length > 0 && (
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <button
+                aria-label="全选当前页账号"
+                className="rounded-lg border border-stone-300 bg-white px-2 py-1 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-50"
+                onClick={selectAllVisibleAccounts}
+                type="button"
+              >
+                全选
+              </button>
+              <button
+                aria-label="反选当前页账号"
+                className="rounded-lg border border-stone-300 bg-white px-2 py-1 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-50"
+                onClick={invertVisibleAccountSelection}
+                type="button"
+              >
+                反选
+              </button>
             </div>
           )}
           <div
