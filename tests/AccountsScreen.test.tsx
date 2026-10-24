@@ -413,7 +413,7 @@ async function selectAccountView(name: "默认组" | "未入池" | "已归档") 
   );
 }
 
-async function openFormTab(name: "基础" | "高级" | "故障处理" | "其他") {
+async function openFormTab(name: "基础" | "高级" | "代理" | "故障处理" | "其他") {
   await userEvent.click(await screen.findByRole("tab", { name }));
 }
 
@@ -5049,6 +5049,88 @@ describe("AccountsScreen", () => {
     const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
     const config = JSON.parse(payload.config_json);
     expect(config.headers["User-Agent"]).toBe("NewBot/2.0");
+  });
+
+  it("hydrates and saves a per-account proxy", async () => {
+    vi.mocked(listRouteCredentials).mockResolvedValue([
+      {
+        ...credentialsFixture[1],
+        config_json: JSON.stringify({
+          base_url: "https://api.example.com/v1",
+          interface_format: "openai",
+          model_mappings: [],
+          proxy_url: "http://127.0.0.1:7890",
+        }),
+      },
+    ]);
+    vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[1]);
+
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
+    await openFormTab("代理");
+
+    expect(screen.getByLabelText("编辑代理地址")).toHaveValue("http://127.0.0.1:7890");
+    await userEvent.clear(screen.getByLabelText("编辑代理地址"));
+    await userEvent.type(
+      screen.getByLabelText("编辑代理地址"),
+      "socks5://user:pass@10.0.0.2:1080",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
+    expect(config.proxy_url).toBe("socks5://user:pass@10.0.0.2:1080");
+  });
+
+  it("clears a per-account proxy when the address is emptied", async () => {
+    vi.mocked(listRouteCredentials).mockResolvedValue([
+      {
+        ...credentialsFixture[1],
+        config_json: JSON.stringify({
+          base_url: "https://api.example.com/v1",
+          interface_format: "openai",
+          model_mappings: [],
+          proxy_url: "http://127.0.0.1:7890",
+        }),
+      },
+    ]);
+    vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[1]);
+
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
+    await openFormTab("代理");
+    await userEvent.clear(screen.getByLabelText("编辑代理地址"));
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
+    expect(config).not.toHaveProperty("proxy_url");
+  });
+
+  it("rejects an invalid proxy address before saving", async () => {
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
+    await openFormTab("代理");
+    await userEvent.type(screen.getByLabelText("编辑代理地址"), "ftp://127.0.0.1:21");
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(
+      screen.getAllByText("仅支持 http、https、socks5、socks5h 代理。").length,
+    ).toBeGreaterThan(0);
+    expect(updateRouteCredential).not.toHaveBeenCalled();
+  });
+
+  it("saves a per-account proxy on official accounts too", async () => {
+    vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[0]);
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("代理");
+    await userEvent.type(screen.getByLabelText("编辑代理地址"), "http://10.0.0.3:8080");
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
+    expect(config.proxy_url).toBe("http://10.0.0.3:8080");
   });
 
   it("hydrates and saves the fetched model list without refetching", async () => {

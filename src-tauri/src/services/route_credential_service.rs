@@ -338,6 +338,14 @@ impl RouteCredentialService {
             crate::services::request_content_rejection::validate(
                 config.get(crate::services::request_content_rejection::CONFIG_KEY),
             )?;
+            crate::services::account_proxy::validate_config(&config).map_err(|message| {
+                AppError::Validation {
+                    code: "validation.route_credential_proxy_url",
+                    message,
+                    details: None,
+                    recoverable: true,
+                }
+            })?;
         }
         let mut input = input;
         // A client that was handed a masked payload instead of the real secret
@@ -774,6 +782,7 @@ fn copied_api_payload(
         "headers",
         "failure_policy",
         "recovery",
+        crate::services::account_proxy::PROXY_URL_CONFIG_KEY,
         RELAY_BALANCE_CONFIG_KEY,
     ] {
         if let Some(value) = source_config.get(key) {
@@ -3602,5 +3611,88 @@ mod content_rejection_setting_tests {
         let config: Value = serde_json::from_str(&updated.config_json).unwrap();
         assert!(config.get("content_rejection_compat").is_none());
         assert_eq!(config["keep"], "yes");
+    }
+}
+
+#[cfg(test)]
+mod proxy_setting_tests {
+    use super::*;
+    use crate::database::{create_memory_pool, run_migrations};
+
+    fn create_input() -> Value {
+        json!({
+            "platform": "codex",
+            "display_name": "proxy fixture",
+            "api_key": "sk-test",
+            "base_url": "https://anyrouter.top/v1",
+            "interface_format": "openai-responses",
+            "model_mappings_json": "[]"
+        })
+    }
+
+    #[tokio::test]
+    async fn account_proxy_round_trips_and_rejects_invalid_addresses() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let row = RouteCredentialService::create_api(
+            &pool,
+            serde_json::from_value(create_input()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let base_update = json!({
+            "display_name": row.display_name,
+            "email": row.email,
+            "status": row.status,
+            "route_priority": row.route_priority,
+            "max_concurrency": row.max_concurrency,
+            "secret_payload_json": row.secret_payload_json,
+            "preview_json": row.preview_json
+        });
+
+        let mut update = base_update.clone();
+        update["config_json"] =
+            json!(r#"{"keep":"yes","proxy_url":"socks5://user:pass@10.0.0.1:1080"}"#);
+        let updated = RouteCredentialService::update(
+            &pool,
+            row.id.clone(),
+            serde_json::from_value(update).unwrap(),
+        )
+        .await
+        .unwrap();
+        let config: Value = serde_json::from_str(&updated.config_json).unwrap();
+        assert_eq!(config["proxy_url"], "socks5://user:pass@10.0.0.1:1080");
+        assert_eq!(config["keep"], "yes");
+
+        // A rejected update must not overwrite what is already stored.
+        let mut invalid = base_update.clone();
+        invalid["config_json"] = json!(r#"{"proxy_url":"ftp://10.0.0.1"}"#);
+        assert!(RouteCredentialService::update(
+            &pool,
+            row.id.clone(),
+            serde_json::from_value(invalid).unwrap(),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &row.id)
+                .await
+                .unwrap()
+                .config_json,
+            updated.config_json
+        );
+
+        // Clearing the field turns the account back to the app-wide proxy.
+        let mut cleared = base_update;
+        cleared["config_json"] = json!(r#"{"keep":"yes"}"#);
+        let cleared = RouteCredentialService::update(
+            &pool,
+            row.id,
+            serde_json::from_value(cleared).unwrap(),
+        )
+        .await
+        .unwrap();
+        let config: Value = serde_json::from_str(&cleared.config_json).unwrap();
+        assert!(config.get("proxy_url").is_none());
     }
 }

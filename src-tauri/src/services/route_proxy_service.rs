@@ -14,12 +14,14 @@ use crate::models::route_credential_model::{
 };
 use crate::models::route_pool::RouteUsageBreakdown;
 use crate::models::settings::DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB;
+use crate::services::account_proxy::account_proxy_url;
 use crate::services::anthropic_thinking::strip_replayed_thinking_from_bytes;
 use crate::services::client_identity;
 use crate::services::codex_reasoning_cache::CodexReasoningCache;
 use crate::services::http_client::{
     build_outbound_http_client, build_outbound_http_client_with_timeouts,
-    outbound_proxy_description, OutboundTimeouts,
+    build_outbound_http_client_with_timeouts_and_proxy, outbound_proxy_description,
+    OutboundTimeouts,
 };
 use crate::services::official_agent_identity_service::{
     resolve_agent_identity_headers, CODEX_CHATGPT_BACKEND_BASE_URL,
@@ -76,6 +78,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use chrono::{DateTime, Utc};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
@@ -452,6 +455,10 @@ pub(crate) struct ProxyAppState {
     /// the call site so tests can drive a stalled upstream in milliseconds
     /// instead of waiting out the production ceiling.
     upstream_timeouts: OutboundTimeouts,
+    /// Clients keyed by account proxy URL. Kept across requests so an account
+    /// that owns an IP keeps its connection pool instead of reconnecting (and
+    /// re-negotiating TLS) on every request.
+    proxy_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
     /// Shared with the runtime so saving settings affects existing listeners.
     request_body_limit_mib: Arc<AtomicU32>,
 }
@@ -486,6 +493,34 @@ impl ProxyAppState {
             read: Some(UPSTREAM_READ_TIMEOUT),
             ..OutboundTimeouts::default()
         }
+    }
+
+    /// The client this account's requests must use. Accounts without a proxy
+    /// share `default_client`, which already honours the app-wide settings.
+    fn outbound_client_for_config(
+        &self,
+        default_client: &Client,
+        config_json: &str,
+    ) -> Result<Client, String> {
+        let Some(proxy_url) = account_proxy_url(config_json) else {
+            return Ok(default_client.clone());
+        };
+        {
+            let cache = self
+                .proxy_clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(client) = cache.get(&proxy_url) {
+                return Ok(client.clone());
+            }
+        }
+        let client =
+            build_outbound_http_client_with_timeouts_and_proxy(self.upstream_timeouts, &proxy_url)?;
+        self.proxy_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(proxy_url, client.clone());
+        Ok(client)
     }
 }
 
@@ -559,6 +594,7 @@ pub(crate) fn build_proxy_state(
         live_log: runtime.live_log.clone(),
         codex_history: CodexReasoningCache::default(),
         upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+        proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
         request_body_limit_mib: runtime.request_body_limit_mib.clone(),
     }
 }
@@ -1155,14 +1191,19 @@ pub(crate) async fn forward_request(
 
     let custom_tool_names = collect_custom_tool_names(&body_bytes);
     let upstream_query = strip_route_proxy_auth_query(query.as_deref());
-    let client = build_outbound_http_client_with_timeouts(state.upstream_timeouts)?;
+    let default_client = build_outbound_http_client_with_timeouts(state.upstream_timeouts)?;
     // Fallback for upstreams that fetch remote image URLs and reject non-image
     // Content-Types (e.g. OSS objects served as text/plain): when a routed
     // credential opts in, inline remote images as base64 data URLs up front.
     // Mutable because a rejected reasoning signature is recovered by rewriting
     // the body and re-asking the same account; see the retry loop below.
-    let mut body_bytes = if credentials.iter().any(selected_credential_inlines_images) {
-        axum::body::Bytes::from(inline_remote_image_urls_in_body(&body_bytes, &client).await)
+    let mut body_bytes = if let Some(image_credential) = credentials
+        .iter()
+        .find(|credential| selected_credential_inlines_images(credential))
+    {
+        let image_client =
+            state.outbound_client_for_config(&default_client, &image_credential.config_json)?;
+        axum::body::Bytes::from(inline_remote_image_urls_in_body(&body_bytes, &image_client).await)
     } else {
         body_bytes
     };
@@ -1293,6 +1334,47 @@ pub(crate) async fn forward_request(
             };
         let failure_policy =
             RouteCredentialFailurePolicy::from_config_json(&credential.config_json);
+        let client =
+            match state.outbound_client_for_config(&default_client, &credential.config_json) {
+                Ok(client) => client,
+                Err(error) => {
+                    record_route_credential_failure(
+                        &state.activity,
+                        &platform,
+                        pool,
+                        &credential,
+                        selected_model_key.as_deref(),
+                        "proxy",
+                        &error,
+                        None,
+                    )
+                    .await;
+                    emit_live_log(
+                        state,
+                        &platform,
+                        &credential,
+                        attempt,
+                        &path,
+                        None,
+                        None,
+                        None,
+                        false,
+                        trace_id.as_deref(),
+                        request_start,
+                        Some(&error),
+                        requested_model.as_deref(),
+                        None,
+                        None,
+                        Some(&body_bytes),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    retry_errors.push(format!("{}: {error}", credential.display_name));
+                    continue;
+                }
+            };
         let upstream_request = build_upstream_request_internal(
             &credential,
             &platform,
@@ -4166,13 +4248,22 @@ impl StreamPump {
             if built.bridge_kind != expected_bridge || credential.kind != "api" {
                 return false;
             }
-            let client = match build_outbound_http_client_with_timeouts(state.upstream_timeouts) {
-                Ok(client) => client,
-                Err(error) => {
-                    eprintln!("[route-continuation] 构造 HTTP 客户端失败: {error}");
-                    return false;
-                }
-            };
+            let default_client =
+                match build_outbound_http_client_with_timeouts(state.upstream_timeouts) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        eprintln!("[route-continuation] 构造 HTTP 客户端失败: {error}");
+                        return false;
+                    }
+                };
+            let client =
+                match state.outbound_client_for_config(&default_client, &credential.config_json) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        eprintln!("[route-continuation] 构造账号代理客户端失败: {error}");
+                        return false;
+                    }
+                };
             let resume_bridge = IncrementalResponseBridge::new(
                 ProtocolBridgeKind::ResponsesToResponses,
                 &built.tool_namespaces,
@@ -16172,6 +16263,7 @@ data: [DONE]\n\n";
             live_log: RouteProxyLiveLog::default(),
             codex_history: CodexReasoningCache::default(),
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
         };
 
@@ -16207,6 +16299,7 @@ data: [DONE]\n\n";
             live_log: RouteProxyLiveLog::default(),
             codex_history: CodexReasoningCache::default(),
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
         };
 
@@ -16237,6 +16330,7 @@ data: [DONE]\n\n";
             live_log: RouteProxyLiveLog::default(),
             codex_history: CodexReasoningCache::default(),
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
         };
 
@@ -16280,6 +16374,7 @@ data: [DONE]\n\n";
             live_log: RouteProxyLiveLog::default(),
             codex_history: CodexReasoningCache::default(),
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
         };
 

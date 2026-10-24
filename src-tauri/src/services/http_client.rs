@@ -73,23 +73,50 @@ pub fn build_outbound_http_client(timeout: Option<Duration>) -> Result<Client, S
     build_outbound_http_client_with_root_certificate(timeout, None)
 }
 
+/// Build a client that always dials through `proxy_url`, ignoring the app-wide
+/// proxy resolution. Used for accounts that carry their own proxy.
+pub fn build_outbound_http_client_with_proxy(
+    timeout: Option<Duration>,
+    proxy_url: &str,
+) -> Result<Client, String> {
+    build_outbound_http_client_inner(
+        OutboundTimeouts::total_only(timeout),
+        None,
+        Some(proxy_url),
+    )
+}
+
 /// Like [`build_outbound_http_client`], but takes the full set of deadlines.
 pub fn build_outbound_http_client_with_timeouts(
     timeouts: OutboundTimeouts,
 ) -> Result<Client, String> {
-    build_outbound_http_client_inner(timeouts, None)
+    build_outbound_http_client_inner(timeouts, None, None)
+}
+
+/// Like [`build_outbound_http_client_with_timeouts`], but dials through an
+/// explicit proxy instead of the app-wide one.
+pub fn build_outbound_http_client_with_timeouts_and_proxy(
+    timeouts: OutboundTimeouts,
+    proxy_url: &str,
+) -> Result<Client, String> {
+    build_outbound_http_client_inner(timeouts, None, Some(proxy_url))
 }
 
 pub fn build_outbound_http_client_with_root_certificate(
     timeout: Option<Duration>,
     root_certificate_pem: Option<&[u8]>,
 ) -> Result<Client, String> {
-    build_outbound_http_client_inner(OutboundTimeouts::total_only(timeout), root_certificate_pem)
+    build_outbound_http_client_inner(
+        OutboundTimeouts::total_only(timeout),
+        root_certificate_pem,
+        None,
+    )
 }
 
 fn build_outbound_http_client_inner(
     timeouts: OutboundTimeouts,
     root_certificate_pem: Option<&[u8]>,
+    explicit_proxy_url: Option<&str>,
 ) -> Result<Client, String> {
     let mut builder = Client::builder()
         .use_rustls_tls()
@@ -110,7 +137,17 @@ fn build_outbound_http_client_inner(
         builder = builder.add_root_certificate(certificate);
     }
 
-    if let Some((proxy_url, no_proxy)) = detect_windows_wininet_proxy() {
+    if let Some(proxy_url) = explicit_proxy_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        // A per-account proxy must win over every app-wide source, and a typo
+        // must fail the account rather than silently leak traffic out the
+        // default IP.
+        let proxy = Proxy::all(proxy_url)
+            .map_err(|error| format!("Could not use account proxy: {error}"))?;
+        builder = builder.proxy(proxy);
+    } else if let Some((proxy_url, no_proxy)) = detect_windows_wininet_proxy() {
         match Proxy::all(proxy_url) {
             Ok(mut proxy) => {
                 if let Some(no_proxy) = no_proxy {
@@ -368,6 +405,27 @@ mod tests {
     fn builds_client_without_panic() {
         let client = build_outbound_http_client(Some(Duration::from_secs(5))).expect("client");
         let _ = client;
+    }
+
+    #[test]
+    fn builds_clients_for_every_supported_account_proxy_scheme() {
+        for proxy_url in [
+            "http://127.0.0.1:7890",
+            "https://proxy.example.com:8443",
+            "socks5://127.0.0.1:1080",
+            "socks5h://user:pass@proxy.example.com:1080",
+        ] {
+            build_outbound_http_client_with_proxy(Some(Duration::from_secs(5)), proxy_url)
+                .unwrap_or_else(|error| panic!("{proxy_url}: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_malformed_account_proxy_fails_instead_of_falling_back_direct() {
+        assert!(
+            build_outbound_http_client_with_proxy(Some(Duration::from_secs(5)), "not a url")
+                .is_err()
+        );
     }
 
     #[test]

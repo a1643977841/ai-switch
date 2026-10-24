@@ -1,3 +1,4 @@
+pub(crate) mod account_proxy;
 pub mod agent_launch_service;
 pub(crate) mod anthropic_thinking;
 pub mod batch_service;

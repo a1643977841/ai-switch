@@ -201,6 +201,11 @@ import {
   presetsForPlatform,
 } from "../lib/accountPresets";
 import {
+  readProxyUrlFromConfig,
+  proxyUrlError,
+  writeProxyUrlToConfig,
+} from "../lib/accountProxy";
+import {
   matchUserAgentPreset,
   readUserAgentFromConfig,
   USER_AGENT_PRESETS,
@@ -241,7 +246,7 @@ type PlatformKey = PlatformId;
 type CreateMode = "api" | "official" | "external";
 type AccountView = "in_pool" | "out_of_pool" | "archived";
 type CreateTab = "basic" | "advanced";
-type EditTab = "basic" | "advanced" | "failure" | "other";
+type EditTab = "basic" | "advanced" | "proxy" | "failure" | "other";
 type RowAction = {
   key: string;
   ariaLabel: string;
@@ -340,6 +345,7 @@ const createTabs: Array<FormTab<CreateTab>> = [
 const editTabs: Array<FormTab<EditTab>> = [
   { value: "basic", label: "基础" },
   { value: "advanced", label: "高级" },
+  { value: "proxy", label: "代理" },
   { value: "failure", label: "故障处理" },
   { value: "other", label: "其他" },
 ];
@@ -3483,6 +3489,8 @@ export function AccountsScreen({
   const [editTurnReminder, setEditTurnReminder] = useState(false);
   const [editTurnReminderText, setEditTurnReminderText] = useState("");
   const [editUserAgent, setEditUserAgent] = useState("");
+  const [editProxyUrl, setEditProxyUrl] = useState("");
+  const [editProxyError, setEditProxyError] = useState<string | null>(null);
   const [editRelayBalance, setEditRelayBalance] = useState<RelayBalanceFormState>(
     emptyRelayBalanceForm,
   );
@@ -4177,6 +4185,8 @@ export function AccountsScreen({
     setEditSecretJson(parseJsonPreview(editingCredential.secret_payload_json, editingCredential.secret_payload_json));
     setEditConfigJson(parseJsonPreview(editingCredential.config_json, editingCredential.config_json));
     setEditUserAgent(readUserAgentFromConfig(config));
+    setEditProxyUrl(readProxyUrlFromConfig(config));
+    setEditProxyError(null);
     if (editingCredential.kind === "api") {
       const interfaceFormat = interfaceFormatFromConfig(config);
       setEditApiKey(stringFromRecord(secret, "api_key"));
@@ -5338,6 +5348,13 @@ export function AccountsScreen({
         setEditTab("advanced");
         throw new Error("最大并发数必须是大于等于 1 的整数");
       }
+      const proxyError = proxyUrlError(editProxyUrl);
+      if (proxyError) {
+        setEditProxyError(proxyError);
+        setEditTab("proxy");
+        throw new Error(proxyError);
+      }
+      setEditProxyError(null);
       const retryCount = Number(editRetryCount);
       const retryIntervalMs = Number(editRetryIntervalMs);
       const semanticErrorThreshold = Number(editSemanticErrorThreshold);
@@ -5439,10 +5456,11 @@ export function AccountsScreen({
               ),
               editUserAgent,
             );
+      const configWithProxy = writeProxyUrlToConfig(baseConfig, editProxyUrl);
       const configWithFetchedModels =
         editingCredential.kind === "api"
-          ? writeFetchedModelsToConfig(baseConfig, editFetchedModels)
-          : baseConfig;
+          ? writeFetchedModelsToConfig(configWithProxy, editFetchedModels)
+          : configWithProxy;
       const configWithRelayBalance =
         editingCredential.kind === "api"
           ? writeRelayBalanceToConfig(
@@ -9840,6 +9858,41 @@ export function AccountsScreen({
                   </div>
                 </>
               ) : null}
+              {editTab === "proxy" ? (
+                <section
+                  aria-label="账号代理设置"
+                  className="grid gap-3 rounded-xl border border-sky-100 bg-sky-50/50 p-3"
+                >
+                  <div>
+                    <p className="text-[13px] font-semibold text-stone-900">独立出口代理</p>
+                    <p className="mt-0.5 text-[11px] font-medium text-stone-500">
+                      填写后该账号的上游请求都从这个代理发出，可给不同账号分配不同出口 IP；留空则沿用应用全局代理（环境变量或系统代理）。
+                    </p>
+                  </div>
+                  <label className={labelClass}>
+                    代理地址
+                    <input
+                      aria-label="编辑代理地址"
+                      className={fieldClass}
+                      onChange={(event) => {
+                        setEditProxyUrl(event.target.value);
+                        setEditProxyError(null);
+                      }}
+                      placeholder="http://127.0.0.1:7890"
+                      value={editProxyUrl}
+                    />
+                    {editProxyError ? (
+                      <span className="text-[12px] font-semibold text-red-700">
+                        {editProxyError}
+                      </span>
+                    ) : null}
+                  </label>
+                  <p className="text-[11px] leading-5 text-stone-500">
+                    支持 http、https、socks5、socks5h。需要认证时写成
+                    {" scheme://user:pass@host:port"}；该代理只作用于本账号，不影响其他账号的出口。
+                  </p>
+                </section>
+              ) : null}
               {editTab === "failure" ? (
                 <>
                   <section
@@ -10564,6 +10617,8 @@ export function AccountsScreen({
                             const nextConfigJson = event.target.value;
                             setEditConfigJson(nextConfigJson);
                             setEditUserAgent(readUserAgentFromConfig(parseJsonObject(nextConfigJson)));
+                            setEditProxyUrl(readProxyUrlFromConfig(parseJsonObject(nextConfigJson)));
+                            setEditProxyError(null);
                             setEditModelMappings(parseModelMappingsFromConfig(nextConfigJson));
                             setEditModelMappingsError(null);
                             setEditFetchedModels([]);

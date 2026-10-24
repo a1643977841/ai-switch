@@ -10,9 +10,11 @@ use crate::models::route_pool::{
     RoutePoolModelTestOutcome, RoutePoolModelTestRequest, RouteUsageBreakdown,
 };
 use crate::models::route_relay_balance::RELAY_BALANCE_ACCESS_TOKEN_KEY;
+use crate::services::account_proxy::account_proxy_url;
 use crate::services::client_identity;
 use crate::services::http_client::{
-    build_outbound_http_client, build_outbound_http_client_with_root_certificate,
+    build_outbound_http_client, build_outbound_http_client_with_proxy,
+    build_outbound_http_client_with_root_certificate,
 };
 use crate::services::platform_capability_service::PlatformCapabilityService;
 use crate::services::response_failure_service::{
@@ -259,7 +261,14 @@ impl RouteModelTestService {
             ..parts
         };
 
-        let client = match build_outbound_http_client(Some(Duration::from_secs(30))) {
+        let client = match account_proxy_url(&credential.config_json) {
+            Some(proxy_url) => build_outbound_http_client_with_proxy(
+                Some(Duration::from_secs(30)),
+                &proxy_url,
+            ),
+            None => build_outbound_http_client(Some(Duration::from_secs(30))),
+        };
+        let client = match client {
             Ok(client) => client,
             Err(error) => {
                 return finish_outcome(
